@@ -1,4 +1,4 @@
-FROM ghcr.io/kamailio/kamailio:5.7.5-bullseye
+FROM ghcr.io/kamailio/kamailio:5.7.5-bookworm@sha256:2e109d4dc7ef395e02c8f7266e05a9356dd711309923215c93fe3e90676f48db
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG S6_OVERLAY_VERSION=3.2.0.2
@@ -25,12 +25,12 @@ RUN apt-get update \
       gnupg wget procps iproute2 openssl tcpdump sngrep \
   && rm -rf /var/lib/apt/lists/*
 
-# Add RTPengine apt repo (bullseye) maintained by Kamailio community
+# Add RTPengine apt repo (bookworm) maintained by Kamailio community
 # Repo list is published here: https://deb.kamailio.org/rtpengine.html
 RUN set -eux; \
-  wget -qO- http://deb.kamailio.org/kamailiodebkey.gpg \
+  wget -qO- https://deb.kamailio.org/kamailiodebkey.gpg \
     | gpg --dearmor -o /usr/share/keyrings/kamailio-archive.gpg; \
-  echo "deb [signed-by=/usr/share/keyrings/kamailio-archive.gpg] http://deb.kamailio.org/rtpengine-mr13.5 bullseye main" \
+  echo "deb [signed-by=/usr/share/keyrings/kamailio-archive.gpg] https://deb.kamailio.org/rtpengine-mr13.5 bookworm main" \
     > /etc/apt/sources.list.d/rtpengine.list; \
   apt-get update; \
   apt-get install -y --no-install-recommends rtpengine; \

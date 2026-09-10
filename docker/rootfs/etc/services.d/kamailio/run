@@ -28,4 +28,5 @@ if [ ! -f "$CFG" ]; then
   CFG="/etc/kamailio/kamailio.cfg"
 fi
 
-exec /usr/sbin/kamailio -DD -E -f "$CFG" -m 64 -M 8
+# Avoid OpenSSL atexit cleanup of shared state during process shutdown.
+exec /usr/sbin/kamailio --atexit=no -DD -E -f "$CFG" -m 64 -M 8

@@ -54,10 +54,9 @@ jobs:
         run: docker build --pull -t webrtc-sip-gateway:ci ./docker
 
       - name: TURN contract through isolated Kamailio
+        # Test packaged files. Runtime initialization validates the rendered
+        # Kamailio config with its actual environment before starting services.
         run: python3 docker/healthcheck/smoke_turn_runtime.py --image webrtc-sip-gateway:ci
-
-      - name: Verify Kamailio config syntax
-        run: docker run --rm --entrypoint /usr/sbin/kamailio webrtc-sip-gateway:ci -c -f /etc/kamailio/kamailio.cfg
 
       - name: Generate temporary TLS cert for runtime tests
         run: |
@@ -84,21 +83,29 @@ jobs:
             -p 15060:5060/tcp \
             -p 15060:5060/udp \
             webrtc-sip-gateway:ci
-          sleep 12
+          ready=0
+          for _ in $(seq 1 60); do
+            if docker exec gwsmoke sh -ec 'rtpengine-ctl -ip 127.0.0.1 -port 7722 list numsessions >/dev/null && ss -lnt | grep -qE ":443[[:space:]]"' >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$ready" -eq 1 ]
 
       - name: Verify runtime smoke process + listeners
         run: |
-          if ! docker exec gwsmoke sh -lc 'comm="$(cat /proc/1/comm)"; [ "$comm" = "init" ] || [ "$comm" = "s6-svscan" ]'; then
+          if ! docker exec gwsmoke sh -ec 'comm="$(cat /proc/1/comm)"; case "$comm" in init|s6-svscan|s6-linux-init|s6-linux-init-shim) exit 0 ;; *) exit 1 ;; esac'; then
             docker logs gwsmoke || true
             exit 1
           fi
 
-          if ! docker exec gwsmoke sh -lc 'cmd="$(ps -eo args | grep -m1 "[r]tpengine --foreground")"; echo "$cmd"; echo "$cmd" | grep -Eq -- "--interface=[0-9.]+![0-9.]+"; ! echo "$cmd" | grep -Eq -- "--interface=[^ ]*:"'; then
+          if ! docker exec gwsmoke sh -ec 'cmd="$(pgrep -a -x rtpengine)"; echo "$cmd"; [ -n "$cmd" ] && echo "$cmd" | grep -Eq -- "--interface=[0-9.]+![0-9.]+" && ! echo "$cmd" | grep -Eq -- "--interface=[^ ]*:"'; then
             docker logs gwsmoke || true
             exit 1
           fi
 
-          if ! docker exec gwsmoke sh -lc 'ss -lntup | egrep "(:80|:443|:5060)"'; then
+          if ! docker exec gwsmoke sh -ec 'for port in 80 443 5060; do ss -lnt | grep -qE ":${port}[[:space:]]"; done; ss -lnu | grep -qE ":5060[[:space:]]"'; then
             docker logs gwsmoke || true
             exit 1
           fi
@@ -114,7 +121,6 @@ jobs:
             -v "$GITHUB_WORKSPACE/.ci-ssl/key.pem:/etc/ssl/key.pem:ro" \
             -p 18080:80 \
             webrtc-sip-gateway:ci
-          sleep 12
 
       - name: Verify dev mode boot (ALLOWED_SIP_DOMAINS empty)
         run: |
@@ -151,10 +157,15 @@ jobs:
             -v "$GITHUB_WORKSPACE/.ci-ssl/key.pem:/etc/ssl/key.pem:ro" \
             -p 18081:80 \
             webrtc-sip-gateway:ci
-          sleep 10
-          docker exec webrtc-sip-gateway-ci-no-turn sh -ec '\
-            code="$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8880/turn-credentials)"; \
-            [ "$code" = "404" ]'
+          ready=0
+          for _ in $(seq 1 30); do
+            if docker exec webrtc-sip-gateway-ci-no-turn sh -ec 'code="$(curl -s --connect-timeout 1 --max-time 2 -o /dev/null -w "%{http_code}" http://127.0.0.1:8880/turn-credentials)"; [ "$code" = "404" ]' >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          [ "$ready" -eq 1 ]
           docker rm -f webrtc-sip-gateway-ci-no-turn
 
       - name: Verify core processes

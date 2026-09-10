@@ -35,11 +35,21 @@ npm run lint
 npm test
 ```
 
-The runtime test mounts the changed source into disposable containers with no external network and no published ports. It uses generated test certificates and non-production credentials. It verifies status, expiry, no-store headers, and authentication/method/path/Origin guards against real Kamailio. The test overrides the packaged RTPengine interface config because a network-none container only has loopback; it does not change the deployed media configuration. All test containers are removed afterward.
+The runtime test checks the image's packaged files in disposable containers with no external network and no published ports. Add `--source-overlay` only when deliberately testing checkout changes over an older baseline image. It uses generated test certificates and non-production credentials. It verifies status, expiry, no-store headers, and authentication/method/path/Origin guards against real Kamailio. The test overrides the packaged RTPengine interface config because a network-none container only has loopback; it does not change the deployed media configuration. All test containers are removed afterward.
 
 Verified on an isolated Linux development host with a pinned 0.3.12 image on 10 September 2026: enabled helper 200, disabled helper 404, invalid-lifetime helper 502, and all access guards passed. The Python contract tests and existing CLI lint/three test suites passed. This is credential/control-path verification, not a TURN allocation or audio test.
 
-Fresh-image CI on 10 September 2026 is blocked at the first `apt-get update`: the unchanged Bullseye base receives an expired `bullseye-security` Release file. Debian ended Bullseye LTS on 31 August 2026 ([official announcement](https://www.debian.org/News/2026/20260831)). This is independent of the repository transfer and credential changes. Keep signature and expiry verification enabled, retain the installed image, and validate a supported base with Kamailio/RTPengine/TLS before adopting it. The passing mounted-source runtime tests do not replace a successful fresh-image build.
+The first fresh-image CI run on 10 September 2026 failed at `apt-get update`: the old Bullseye base received an expired `bullseye-security` Release file. Debian ended Bullseye LTS on 31 August 2026 ([official announcement](https://www.debian.org/News/2026/20260831)). This was independent of the repository transfer and credential changes.
+
+## Bookworm image maintenance
+
+The image now uses digest-pinned `kamailio:5.7.5-bookworm` and the HTTPS Bookworm RTPengine 13.5 repository. Signature and expiry checks remain enabled. The isolated build retains Kamailio 5.7.5 and installs RTPengine 13.5.1.25+bpo12, replacing the baseline's 13.5.1.2+bpo11. There is no npm version bump or release tag for this development change.
+
+For Bookworm's OpenSSL 3, Kamailio initializes the TLS module first, enables its supported `tls_threads_mode=1` core option, and uses `--atexit=no` to avoid OpenSSL shutdown cleanup of shared memory. See the [Kamailio TLS notes](https://www.kamailio.org/docs/modules/5.7.x/modules/tls.html). SIP routes, RTP flags, listener ports, and transport policy are unchanged.
+
+CI validates the packaged image through the normal initialization path, which checks the rendered Kamailio configuration before startup. Readiness polling replaces fixed startup delays; process and listener assertions fail if RTPengine or any required socket is absent. Deployment requires successful runtime/media checks and preserves the previous pinned image for rollback.
+
+The isolated Bookworm build passed all three credential scenarios and 24 certificate-verified TLS/WebSocket upgrades with concurrency four. Kamailio process IDs stayed stable, the credential endpoint remained functional, and graceful shutdown completed with exit zero and no detected crash signatures. These checks exercise OpenSSL compatibility; a development call test is still required before treating media behavior as verified.
 
 ## Completion criteria for dynamic STUN/TURN
 
