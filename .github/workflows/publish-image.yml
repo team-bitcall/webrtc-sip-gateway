@@ -56,8 +56,8 @@ jobs:
           labels: |
             org.opencontainers.image.title=webrtc-sip-gateway
             org.opencontainers.image.description=WebRTC-to-SIP gateway (Kamailio + rtpengine) with ACME and TURN credential endpoints
-            org.opencontainers.image.source=https://github.com/Bitcallio/webrtc-sip-gateway
-            org.opencontainers.image.url=https://github.com/Bitcallio/webrtc-sip-gateway
+            org.opencontainers.image.source=https://github.com/team-bitcall/webrtc-sip-gateway
+            org.opencontainers.image.url=https://github.com/team-bitcall/webrtc-sip-gateway
             org.opencontainers.image.licenses=MIT
 
       - name: Build & push
