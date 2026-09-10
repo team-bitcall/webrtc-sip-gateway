@@ -32,7 +32,8 @@ def main():
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1",
             "-nodes", "-subj", "/CN=relay.example.test", "-keyout", str(key), "-out", str(cert),
             stderr=subprocess.DEVNULL)
-        for mode, ttl, expected in [("coturn", "3600", 200), ("none", "3600", 404), ("coturn", "0", 502)]:
+        for mode, ttl, helper_expected, expected in [
+                ("coturn", "3600", 200, 200), ("none", "3600", 404, 404), ("coturn", "0", 503, 502)]:
             name = "bitcall-turn-contract-" + uuid.uuid4().hex[:12]
             created = False
             try:
@@ -65,6 +66,19 @@ def main():
                     headers, body = output.replace("\r\n", "\n").split("\n\n", 1)
                     return int(headers.splitlines()[0].split()[1]), headers.lower(), body
 
+                deadline = time.monotonic() + 30
+                while True:
+                    try:
+                        helper_status = int(run("docker", "exec", name, "curl", "-s",
+                            "--connect-timeout", "1", "--max-time", "2", "-o", "/dev/null", "-w", "%{http_code}",
+                            "http://127.0.0.1:8880/turn-credentials", stderr=subprocess.DEVNULL))
+                        if helper_status == helper_expected:
+                            break
+                    except subprocess.CalledProcessError:
+                        pass
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Credential helper did not reach its expected state")
+                    time.sleep(0.5)
                 deadline = time.monotonic() + 30
                 while True:
                     try:
