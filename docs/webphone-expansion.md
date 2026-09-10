@@ -30,6 +30,7 @@ The separate webphone repository now has a server-side contract client and tests
 ```sh
 python3 -m unittest discover -s docker/healthcheck -p 'test_*.py'
 python3 docker/healthcheck/smoke_turn_runtime.py --image <installed-gateway-image>
+python3 docker/healthcheck/smoke_dtls_role.py --image <new-gateway-image>
 cd cli
 npm run lint
 npm test
@@ -45,11 +46,13 @@ The first fresh-image CI run on 10 September 2026 failed at `apt-get update`: th
 
 The image now uses digest-pinned `kamailio:5.7.5-bookworm` and the HTTPS Bookworm RTPengine 13.5 repository. Signature and expiry checks remain enabled. The isolated build retains Kamailio 5.7.5 and installs RTPengine 13.5.1.25+bpo12, replacing the baseline's 13.5.1.2+bpo11. There is no npm version bump or release tag for this development change.
 
-For Bookworm's OpenSSL 3, Kamailio initializes the TLS module first, enables its supported `tls_threads_mode=1` core option, and uses `--atexit=no` to avoid OpenSSL shutdown cleanup of shared memory. See the [Kamailio TLS notes](https://www.kamailio.org/docs/modules/5.7.x/modules/tls.html). SIP routes, RTP flags, listener ports, and transport policy are unchanged.
+For Bookworm's OpenSSL 3, Kamailio initializes the TLS module first, enables its supported `tls_threads_mode=1` core option, and uses `--atexit=no` to avoid OpenSSL shutdown cleanup of shared memory. See the [Kamailio TLS notes](https://www.kamailio.org/docs/modules/5.7.x/modules/tls.html). SIP routing and listener ports are unchanged.
+
+The live media check also exposed an existing DTLS role-timing issue: the browser-facing leg could begin an active handshake before the SIP answer selected passive mode. The WS-to-SIP offer now includes `DTLS-reverse=passive`, matching the existing passive answer policy from the start. The provider still uses plain RTP. This follows the [upstream explanation of the same failure](https://github.com/sipwise/rtpengine/issues/1038). An isolated regression test reads the packaged route flags and checks roles before and after the answer; it fails against the preceding image and passes against the corrected image.
 
 CI validates the packaged image through the normal initialization path, which checks the rendered Kamailio configuration before startup. Readiness polling replaces fixed startup delays; process and listener assertions fail if RTPengine or any required socket is absent. Deployment requires successful runtime/media checks and preserves the previous pinned image for rollback.
 
-The isolated Bookworm build passed all three credential scenarios and 24 certificate-verified TLS/WebSocket upgrades with concurrency four. Kamailio process IDs stayed stable, the credential endpoint remained functional, and graceful shutdown completed with exit zero and no detected crash signatures. These checks exercise OpenSSL compatibility; a development call test is still required before treating media behavior as verified.
+The isolated Bookworm build passed all three credential scenarios and 24 certificate-verified TLS/WebSocket upgrades with concurrency four. Kamailio process IDs stayed stable, the credential endpoint remained functional, and graceful shutdown completed with exit zero and no detected crash signatures. Bridge/read-only startup, listener, health, ACME and process checks also passed. The corrected development call connected with a verified DTLS fingerprint and increasing packets in both directions on both legs; no DTLS error appeared. This establishes media forwarding on the tested network, not human confirmation of audible playback or TURN relay coverage.
 
 ## Completion criteria for dynamic STUN/TURN
 

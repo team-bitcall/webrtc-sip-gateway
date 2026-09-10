@@ -58,6 +58,9 @@ jobs:
         # Kamailio config with its actual environment before starting services.
         run: python3 docker/healthcheck/smoke_turn_runtime.py --image webrtc-sip-gateway:ci
 
+      - name: Browser DTLS role stays passive from offer through answer
+        run: python3 docker/healthcheck/smoke_dtls_role.py --image webrtc-sip-gateway:ci
+
       - name: Generate temporary TLS cert for runtime tests
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.ci-ssl"
