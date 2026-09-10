@@ -4,6 +4,8 @@ Branch: `FEAT/webphone-expansion`, based on the installed 0.3.12 revision `73506
 
 Use an isolated development gateway. Deployment-specific addresses, secrets, overlays, and operational runbooks are maintained separately from this public repository. A Git branch switch does not deploy source changes into the pinned container.
 
+During development, push only this feature branch: no version bumps, version tags, package/image releases, or deployment. CI for this branch runs the Python credential tests and CLI lint/unit tests; it skips Docker builds and package dry runs, including pull requests from this branch. Publishing workflows remain tag-triggered. The runtime test can still use the already-installed image as described below, without building a new image.
+
 ## First change: TURN credential contract
 
 - Retain the existing `username`, `credential`, `ttl`, and `uris` response fields; add absolute `expiresAt` in Unix seconds.

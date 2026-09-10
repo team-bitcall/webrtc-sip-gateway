@@ -42,9 +42,11 @@ jobs:
         run: npm test
 
       - name: Package dry run
+        if: github.ref != 'refs/heads/FEAT/webphone-expansion' && github.head_ref != 'FEAT/webphone-expansion'
         run: npm pack --dry-run
 
   docker:
+    if: github.ref != 'refs/heads/FEAT/webphone-expansion' && github.head_ref != 'FEAT/webphone-expansion'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
