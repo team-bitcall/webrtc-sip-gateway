@@ -79,8 +79,15 @@ class AcmeHandler(http.server.BaseHTTPRequestHandler):
 class TurnCredentialsHandler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_path = urlparse(self.path).path
-        if parsed_path != TURN_CREDENTIALS_PATH or not TURN_SECRET:
+        # Keep the legacy secret-only configuration working, but respect an
+        # explicitly disabled relay even if a previous secret is still present.
+        if (parsed_path != TURN_CREDENTIALS_PATH or not TURN_SECRET
+                or os.environ.get("TURN_MODE") == "none"):
             _write_plain(self, 404, "not found")
+            return
+
+        if TURN_TTL <= 0:
+            _write_plain(self, 503, "invalid TURN credential lifetime")
             return
 
         expires_at = int(time.time()) + TURN_TTL
@@ -95,6 +102,7 @@ class TurnCredentialsHandler(http.server.BaseHTTPRequestHandler):
             "username": username,
             "credential": credential,
             "ttl": TURN_TTL,
+            "expiresAt": expires_at,
             "uris": [
                 f"turn:{DOMAIN}:{TURN_UDP_PORT}",
                 f"turn:{DOMAIN}:{TURN_UDP_PORT}?transport=tcp",
@@ -104,6 +112,8 @@ class TurnCredentialsHandler(http.server.BaseHTTPRequestHandler):
         payload = json.dumps(response).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Pragma", "no-cache")
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)

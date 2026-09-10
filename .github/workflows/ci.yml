@@ -4,9 +4,20 @@ on:
   push:
     branches:
       - main
+      - 'FEAT/webphone-expansion'
   pull_request:
 
 jobs:
+  turn-contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: TURN credential contract
+        run: python3 -m unittest discover -s docker/healthcheck -p 'test_*.py'
+
   cli:
     runs-on: ubuntu-latest
     defaults:
@@ -41,6 +52,9 @@ jobs:
 
       - name: Build image
         run: docker build --pull -t webrtc-sip-gateway:ci ./docker
+
+      - name: TURN contract through isolated Kamailio
+        run: python3 docker/healthcheck/smoke_turn_runtime.py --image webrtc-sip-gateway:ci
 
       - name: Verify Kamailio config syntax
         run: docker run --rm --entrypoint /usr/sbin/kamailio webrtc-sip-gateway:ci -c -f /etc/kamailio/kamailio.cfg
