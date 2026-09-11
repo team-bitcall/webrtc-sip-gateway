@@ -30,6 +30,8 @@ The separate webphone repository now has a server-side contract client and tests
 ```sh
 python3 -m unittest discover -s docker/healthcheck -p 'test_*.py'
 python3 docker/healthcheck/smoke_turn_runtime.py --image <installed-gateway-image>
+python3 docker/healthcheck/smoke_register_query.py --image <installed-gateway-image> --source-overlay
+python3 docker/healthcheck/smoke_uac_auth.py --image <installed-gateway-image>
 python3 docker/healthcheck/smoke_dtls_role.py --image <new-gateway-image>
 cd cli
 npm run lint
@@ -53,6 +55,41 @@ The live media check also exposed an existing DTLS role-timing issue: the browse
 CI validates the packaged image through the normal initialization path, which checks the rendered Kamailio configuration before startup. Readiness polling replaces fixed startup delays; process and listener assertions fail if RTPengine or any required socket is absent. Deployment requires successful runtime/media checks and preserves the previous pinned image for rollback.
 
 The isolated Bookworm build passed all three credential scenarios and 24 certificate-verified TLS/WebSocket upgrades with concurrency four. Kamailio process IDs stayed stable, the credential endpoint remained functional, and graceful shutdown completed with exit zero and no detected crash signatures. Bridge/read-only startup, listener, health, ACME and process checks also passed. The corrected development call connected with a verified DTLS fingerprint and increasing packets in both directions on both legs; no DTLS error appeared. This establishes media forwarding on the tested network, not human confirmation of audible playback or TURN relay coverage.
+
+## Contact-less upstream credential verification
+
+An RFC 3261 binding query is a REGISTER without Contact. The gateway now relays
+that request upstream before local `usrloc` save, NAT Contact handling, Path and
+upstream Contact synthesis, reply rewriting, or registration-failure cleanup.
+`is_present_hf("Contact")` also recognizes compact `m`, so existing normal
+registrations retain their Contact rewrite and local binding behavior.
+
+The loopback runtime regression passed all four checks against the installed
+5.7.5 development image with the source overlay: compact-Contact registration,
+Contact-less upstream forwarding without Contact or Expires, preservation of
+the existing local binding after an upstream 403, and the next normal Contact
+rewrite/restore. The corrected configuration is mounted into the existing DEV
+container; the image and Kamailio version are unchanged. The container is
+healthy. No production gateway, listener, release version or published image
+changed.
+
+The actual provider proof used the DEV WSS route and a backend-held credential.
+Its challenge realm is `sippysoft.com`, with MD5 and no qop. Password and HA1
+queries were accepted; wrong password, wrong HA1, mismatched realm, unsupported
+algorithm and mismatched authorization username were rejected. Every upstream
+query omitted Contact and Expires, created no database record, and made no call.
+The provider response proves the exact challenged authorization identity; a
+separate trusted mapping is still required for a provider-internal immutable
+account ID.
+
+The installed image contains Kamailio `uac.so`, although the production gateway
+route remains a transparent SIP relay. A network-none runtime fixture proved
+`uac_auth()` with plaintext and `uac_auth(1)` with HA1 both receive 200 from a
+realm-challenging registrar, while a wrong secret receives 403. All authenticated
+retries incremented CSeq from 1 to 2 explicitly. This capability evidence does
+not add a UAC seat-authentication route; that remains later webphone expansion
+work. See the [Kamailio 5.7 UAC documentation](https://www.kamailio.org/docs/modules/5.7.x/modules/uac.html#uac.f.uac_auth)
+and [RFC 3261 section 10.2.3](https://www.rfc-editor.org/rfc/rfc3261.html#section-10.2.3).
 
 ## Completion criteria for dynamic STUN/TURN
 

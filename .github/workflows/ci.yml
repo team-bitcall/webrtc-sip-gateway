@@ -58,6 +58,12 @@ jobs:
         # Kamailio config with its actual environment before starting services.
         run: python3 docker/healthcheck/smoke_turn_runtime.py --image webrtc-sip-gateway:ci
 
+      - name: Contact-less REGISTER query preserves bindings
+        run: python3 docker/healthcheck/smoke_register_query.py --image webrtc-sip-gateway:ci
+
+      - name: Kamailio UAC plaintext and HA1 authentication
+        run: python3 docker/healthcheck/smoke_uac_auth.py --image webrtc-sip-gateway:ci
+
       - name: Browser DTLS role stays passive from offer through answer
         run: python3 docker/healthcheck/smoke_dtls_role.py --image webrtc-sip-gateway:ci
 
