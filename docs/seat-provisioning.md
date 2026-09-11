@@ -165,5 +165,9 @@ python3 docker/healthcheck/smoke_seat_routing.py --image bitcall-gateway:seat-de
 ```
 
 On 2026-09-11 the Task 11 DEV candidate passed this fixture (15 events, five calls),
-active-dialog RPC inspection and 27 focused gateway tests. Customer activation
+active-dialog RPC inspection and 28 focused gateway tests. Customer activation
 stays disabled. The webphone repository records the matching backend acceptance.
+
+A late answer after a failed INVITE keeps the journal open until an observed end.
+The same applies when failure arrives after answer; losing that dialog later marks
+uncertainty instead of leaving an indefinitely active record.

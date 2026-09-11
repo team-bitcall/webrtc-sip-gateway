@@ -81,6 +81,7 @@ class CallJournal:
             tenant_id TEXT PRIMARY KEY, exported_through INTEGER NOT NULL DEFAULT 0,
             acknowledged_through INTEGER NOT NULL DEFAULT 0);
           CREATE INDEX IF NOT EXISTS events_tenant_sequence ON events(tenant_id, sequence);
+          CREATE INDEX IF NOT EXISTS events_call_sequence ON events(call_id, sequence);
         """)
         if "acked_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(events)")}:
             self.db.execute("ALTER TABLE events ADD COLUMN acked_at INTEGER")
@@ -134,6 +135,29 @@ class CallJournal:
           "destination": context["destination"], "requestedCallerId": context["requestedCallerId"],
           "effectiveCallerId": context["effectiveCallerId"], "sipCode": sip_code, "reason": reason, "endedBy": ended_by}
 
+    def _has_event(self, call_id, event_type):
+        """Events stay schema-flexible in SQLite; inspect their canonical payload."""
+        for row in self.db.execute("SELECT payload FROM events WHERE call_id=?", (call_id,)):
+            if json.loads(row["payload"]).get("type") == event_type:
+                return True
+        return False
+
+    def _materialize_lifecycle(self, call_id, event_type, occurred_at):
+        """Preserve an answered dialog until an actual ending event is observed."""
+        if event_type not in {"answered", "failed", "ended", "uncertain"}:
+            return
+        ended = self._has_event(call_id, "ended")
+        if event_type == "answered":
+            if not ended:
+                self.db.execute("UPDATE calls SET terminal=0, terminal_at=NULL WHERE call_id=?", (call_id,))
+            return
+        if event_type == "failed" and not ended and self._has_event(call_id, "answered"):
+            self.db.execute("UPDATE calls SET terminal=0, terminal_at=NULL WHERE call_id=?", (call_id,))
+            return
+        if event_type in {"failed", "ended", "uncertain"}:
+            self.db.execute("UPDATE calls SET terminal=1, terminal_at=COALESCE(terminal_at, ?) WHERE call_id=?",
+                            (occurred_at, call_id))
+
     def _append(self, context, call_id, event_type, occurred_at, leg_id="", sip_code=None, reason=None, ended_by=None):
         event = self._event(context, call_id, event_type, occurred_at, leg_id, sip_code, reason, ended_by)
         semantic = hashlib.sha256(_canonical([call_id, event_type, leg_id, sip_code, reason, ended_by]).encode()).hexdigest()
@@ -146,8 +170,7 @@ class CallJournal:
                                  (event_id, call_id, context["tenantId"], semantic, _canonical(event), occurred_at))
         event["sequence"] = cursor.lastrowid
         self.db.execute("UPDATE events SET payload=? WHERE sequence=?", (_canonical(event), event["sequence"]))
-        if event_type in {"failed", "ended", "uncertain"}:
-            self.db.execute("UPDATE calls SET terminal=1, terminal_at=COALESCE(terminal_at, ?) WHERE call_id=?", (occurred_at, call_id))
+        self._materialize_lifecycle(call_id, event_type, occurred_at)
         return event
 
     def admit(self, value):

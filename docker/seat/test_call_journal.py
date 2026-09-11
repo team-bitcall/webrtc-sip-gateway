@@ -78,6 +78,36 @@ class CallJournalTests(unittest.TestCase):
             self.assertEqual(restarted.events(context()["tenantId"])["events"][-1]["type"], "uncertain")
             restarted.close()
 
+    def test_answer_evidence_reopens_failed_call_but_never_ended_call(self):
+        clock = [1_000]
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            journal = CallJournal(directory, clock=lambda: clock[0])
+
+            def append(call_id, event_type, sip_code, reason=None, ended_by=None):
+                return journal.append({"callId": call_id, "type": event_type, "legId": "to-tag",
+                                       "sipCode": sip_code, "reason": reason, "endedBy": ended_by})
+
+            _, failed_then_answered = journal.admit(context())
+            append(failed_then_answered, "failed", 487, "cancelled", "upstream")
+            append(failed_then_answered, "answered", 200)
+            self.assertEqual(journal.db.execute("SELECT terminal FROM calls WHERE call_id=?", (failed_then_answered,)).fetchone()["terminal"], 0)
+
+            _, answered_then_failed = journal.admit({**context(), "sipCallId": "answer-first@example.test", "fromTag": "two"})
+            append(answered_then_failed, "answered", 200)
+            append(answered_then_failed, "failed", 487, "cancelled", "upstream")
+            self.assertEqual(journal.db.execute("SELECT terminal FROM calls WHERE call_id=?", (answered_then_failed,)).fetchone()["terminal"], 0)
+
+            _, ended_then_answered = journal.admit({**context(), "sipCallId": "ended@example.test", "fromTag": "three"})
+            append(ended_then_answered, "ended", 200, "normal", "agent")
+            append(ended_then_answered, "answered", 200)
+            self.assertEqual(journal.db.execute("SELECT terminal FROM calls WHERE call_id=?", (ended_then_answered,)).fetchone()["terminal"], 1)
+
+            journal.reconcile_active(set(), grace_ms=0)
+            events = journal.events(context()["tenantId"])["events"]
+            self.assertEqual([event["type"] for event in events if event["callId"] == failed_then_answered][-1], "uncertain")
+            journal.close()
+
     def test_acknowledged_terminal_evidence_compacts_after_retention_but_active_context_remains(self):
         clock = [1_000]
         with tempfile.TemporaryDirectory() as directory:
