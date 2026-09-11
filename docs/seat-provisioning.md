@@ -38,6 +38,15 @@ withdraws all new calling authority for that tenant. Revisions are positive safe
 integers; lease duration is at most 300 seconds. Body limit is 4 MiB. Seat/profile
 limits remain 10,000/1,000 per snapshot.
 
+A seat may add `callerIdPolicy` with exactly `mode`, `allowedNumbers` and
+`defaultNumber`. `mode` is `assigned` or `flexible`; values use `^\\+?[0-9]{1,32}$`.
+Assigned mode has at most 100 unique allowed numbers and an empty or allowed default;
+flexible mode has an empty allowed list and an optional numeric default. Policy absence
+retains the task 08 fixed profile `fromUser`. Browser seats keep `From` as their seat
+identity and send one `X-Bitcall-Caller-ID` hint. The gateway strips client identity
+headers and generates trusted P-Asserted-Identity and Remote-Party-ID from the
+effective policy identity.
+
 Successful response:
 
 ```json

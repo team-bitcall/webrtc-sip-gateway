@@ -73,6 +73,9 @@ jobs:
       - name: Seat call cancellation and upstream failure handling
         run: python3 docker/healthcheck/seat_dialog_fixture.py --image webrtc-sip-gateway:ci
 
+      - name: Caller identity stays fixed across existing call dialogs
+        run: python3 docker/healthcheck/seat_dialog_fixture.py --image webrtc-sip-gateway:ci --caller-id
+
       - name: Legacy registration with local seats and no control backend
         run: python3 docker/healthcheck/smoke_register_query.py --image webrtc-sip-gateway:ci --seat-mode
 

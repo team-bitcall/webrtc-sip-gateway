@@ -90,11 +90,15 @@ def carrier():
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.bind(("127.0.0.1", UPSTREAM)); s.settimeout(12)
+            expected_caller_ids = ["+12025550100", "+12025550199"]
             for index in range(2):
                 invite, peer = s.recvfrom(65535); invite = invite.decode(); line, h = parse(invite)
-                assert line.startswith("INVITE ") and "upstream-a" in h["from"][0], line
+                assert line.startswith("INVITE ") and expected_caller_ids[index] in h["from"][0], line
                 assert not any(key.startswith("p-k-cseq") for key in h), h
-                assert "x-bitcall-tenant" not in h and "p-asserted-identity" not in h, h
+                assert "x-bitcall-tenant" not in h, h
+                assert h.get("p-asserted-identity", [""])[0].find(expected_caller_ids[index]) >= 0, h
+                assert h.get("remote-party-id", [""])[0].find(expected_caller_ids[index]) >= 0, h
+                assert "forged@example.test" not in "\n".join(h.get("p-asserted-identity", []) + h.get("remote-party-id", [])), h
                 assert "authorization" not in h and "proxy-authorization" not in h, h
                 initial_cseq = int(h["cseq"][0].split()[0])
                 seen[0] += 1
@@ -153,13 +157,32 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
         send_frame(ws, request("REGISTER", "sip:" + SEAT_DOMAIN, "nobody", 4, call).replace(SEAT_DOMAIN, bad_domain)); status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 403 "), status
     status, _ = challenged("REGISTER", "sip:" + SEAT_DOMAIN, "alice", LOCAL_PASSWORD, 5, call, from_user="bob"); assert status.startswith("SIP/2.0 401 "), status
     time.sleep(.2); assert seen[0] == 0, seen
+    # Owner assigned policy rejects an unassigned requested number before upstream.
+    call = uuid.uuid4().hex + "@phone.invalid"
+    status, _ = challenged("INVITE", "sip:18005550100@" + SEAT_DOMAIN, "alice", LOCAL_PASSWORD, 8, call, extra=("X-Bitcall-Caller-ID: +12025559999",)); assert status.startswith("SIP/2.0 403 "), status
+    # Caller-ID hints are parsed only for INVITEs, after local authentication.
+    # Malformed, ambiguous, and required-but-empty hints must never reach the carrier.
+    for cseq, user, password, headers in (
+        (12, "alice", LOCAL_PASSWORD, ("X-Bitcall-Caller-ID: +1202555oops",)),
+        (14, "alice", LOCAL_PASSWORD, ("X-Bitcall-Caller-ID: +12025550100", "X-Bitcall-Caller-ID: +12025550101")),
+        (16, "bob", "other-pass", ("X-Bitcall-Caller-ID: ",)),
+    ):
+        call = uuid.uuid4().hex + "@phone.invalid"
+        status, _ = challenged("INVITE", "sip:18005550100@" + SEAT_DOMAIN, user, password, cseq, call, extra=headers)
+        assert status.startswith("SIP/2.0 400 "), status
+    time.sleep(.2); assert seen[0] == 0, seen
     # Owner and agent each complete a local REGISTER, then an INVITE through one profile.
-    for user, password, cseq in (("alice", LOCAL_PASSWORD, 10), ("bob", "other-pass", 20)):
+    # Alice omits the hint to prove assigned-policy defaulting. Bob has an empty
+    # flexible default and may choose a number outside the inventory.
+    for user, password, cseq, caller_id in (("alice", LOCAL_PASSWORD, 20, None), ("bob", "other-pass", 30, "+12025550199")):
         call = uuid.uuid4().hex + "@phone.invalid"
         status, reg_headers = challenged("REGISTER", "sip:" + SEAT_DOMAIN, user, password, cseq, call); assert status.startswith("SIP/2.0 200 "), status
         assert len(reg_headers.get("contact", [])) == 1 and reg_headers["contact"][0].startswith("<sip:%s@browser.invalid;transport=ws>;expires=600" % user), "local Contact was not retained"
         uri = "sip:18005550100@" + SEAT_DOMAIN
-        status, reply_headers = challenged("INVITE", uri, user, password, cseq + 2, call, extra=("Contact: <sip:phone@browser.invalid;transport=ws>", "P-K-CSeq-Auth: 9999", "P-K-CSeq-Refresh: 9999", "X-Bitcall-Tenant: forged", "P-Asserted-Identity: <sip:forged@example.test>")); assert status.startswith("SIP/2.0 200 "), status
+        headers = ("Contact: <sip:phone@browser.invalid;transport=ws>", "P-K-CSeq-Auth: 9999", "P-K-CSeq-Refresh: 9999", "X-Bitcall-Tenant: forged", "P-Asserted-Identity: <sip:forged@example.test>", "Remote-Party-ID: <sip:forged@example.test>")
+        if caller_id:
+            headers += ("X-Bitcall-Caller-ID: " + caller_id,)
+        status, reply_headers = challenged("INVITE", uri, user, password, cseq + 2, call, extra=headers); assert status.startswith("SIP/2.0 200 "), status
         assert reply_headers["cseq"] == ["%d INVITE" % (cseq + 3)], reply_headers
         assert "contact" in reply_headers and "record-route" in reply_headers, reply_headers
         target = reply_headers["contact"][0].split("<", 1)[1].split(">", 1)[0]
@@ -174,6 +197,7 @@ print("PASS local denial isolation")
 print("PASS owner password-profile upstream digest")
 print("PASS agent HA1-profile upstream digest")
 print("PASS CSeq and identity-header isolation")
+print("PASS caller-ID policy validation and default/flexible selection")
 '''
 
 
@@ -189,12 +213,17 @@ def diagnostic_logs(name):
     return "\n".join(keep)
 
 
-def snapshot():
+def snapshot(caller_ids=False):
     ha1 = __import__("hashlib").md5(b"alice:seats.example.test:local-pass").hexdigest()
-    return {"schemaVersion": 1, "revision": 1, "issuedAt": int(time.time()), "validUntil": int(time.time()) + 240,
+    data = {"schemaVersion": 1, "revision": 1, "issuedAt": int(time.time()), "validUntil": int(time.time()) + 240,
             "domain": "seats.example.test",
             "profiles": [{"id": "profile-a", "tenantId": "tenant-a", "enabled": True, "username": "upstream-a", "realm": "carrier.example.test", "requestDomain": "carrier.example.test", "outboundProxy": "sip:127.0.0.1:15060;transport=udp", "credential": {"kind": "password", "value": "carrier-pass"}, "fromUser": "upstream-a"}, {"id": "profile-b", "tenantId": "tenant-a", "enabled": True, "username": "upstream-a", "realm": "carrier.example.test", "requestDomain": "carrier.example.test", "outboundProxy": "sip:127.0.0.1:15060;transport=udp", "credential": {"kind": "ha1", "value": "6ee53e85140577a263e338faa5535881"}, "fromUser": "upstream-a"}],
-            "seats": [{"id": "alice-seat", "tenantId": "tenant-a", "username": "alice", "profileId": "profile-a", "enabled": True, "ha1": ha1}, {"id": "bob-seat", "tenantId": "tenant-a", "username": "bob", "profileId": "profile-b", "enabled": True, "ha1": __import__("hashlib").md5(b"bob:seats.example.test:other-pass").hexdigest()}, {"id": "revoked-seat", "tenantId": "tenant-a", "username": "revoked", "profileId": "profile-a", "enabled": False, "ha1": ha1}]}
+            "seats": [{"id": "alice-seat", "tenantId": "tenant-a", "username": "alice", "profileId": "profile-a", "enabled": True, "ha1": ha1, "callerIdPolicy": {"mode": "assigned", "allowedNumbers": ["+12025550100", "+12025550101"], "defaultNumber": "+12025550100"}}, {"id": "bob-seat", "tenantId": "tenant-a", "username": "bob", "profileId": "profile-b", "enabled": True, "ha1": __import__("hashlib").md5(b"bob:seats.example.test:other-pass").hexdigest(), "callerIdPolicy": {"mode": "flexible", "allowedNumbers": [], "defaultNumber": ""}}, {"id": "revoked-seat", "tenantId": "tenant-a", "username": "revoked", "profileId": "profile-a", "enabled": False, "ha1": ha1}]}
+    if not caller_ids:
+        for seat in data["seats"]:
+            seat.pop("callerIdPolicy", None)
+    return data
+
 
 
 def main():
@@ -215,7 +244,7 @@ def main():
     created = False
     with tempfile.TemporaryDirectory(prefix="bitcall-seat-routing-") as temp:
         temp = Path(temp); cert, key, state = temp / "cert.pem", temp / "key.pem", temp / "seats.json"
-        state.write_text(json.dumps(snapshot()), encoding="utf-8"); state.chmod(0o600)
+        state.write_text(json.dumps(snapshot(caller_ids=True)), encoding="utf-8"); state.chmod(0o600)
         (temp / "rtpengine.conf").write_text("[rtpengine]\n")
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-subj", "/CN=query.example.test", "-addext", "subjectAltName=DNS:query.example.test", "-keyout", str(key), "-out", str(cert), stderr=subprocess.DEVNULL)
         renderer_copy = temp / "07-render-kamailio-cfg"

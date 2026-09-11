@@ -30,6 +30,7 @@ retransmit_sent = threading.Event()
 expiry_ready = threading.Event()
 timeout_case_done = threading.Event()
 LEASE_UNTIL = int(os.environ["FIXTURE_VALID_UNTIL"])
+FIXTURE_CALLER_ID = os.environ.get("FIXTURE_CALLER_ID", "")
 
 def exact(sock, size):
     data = b""
@@ -67,7 +68,7 @@ def response(request, code, reason, challenge):
     _, h = parse(request)
     lines = ["SIP/2.0 %d %s" % (code, reason)]
     lines += ["Via: " + value for value in h["via"]]
-    to = h["to"][0] + ("" if ";tag=" in h["to"][0] else ";tag=edge")
+    to = h["to"][0] + ("" if ";tag=" in h["to"][0] else ";tag=provider-edge")
     lines += ["From: " + h["from"][0], "To: " + to, "Call-ID: " + h["call-id"][0], "CSeq: " + h["cseq"][0]]
     if challenge: lines.append(challenge)
     lines += ["Content-Length: 0", "", ""]
@@ -96,6 +97,10 @@ def dialog_request(method, uri, call, cseq, to, routes, branch=None):
     lines = ["%s %s SIP/2.0" % (method, uri), "Via: SIP/2.0/WSS edge.invalid;branch=" + branch + ";rport", "Max-Forwards: 16", "From: <sip:alice@%s>;tag=edge" % SEAT_DOMAIN, "To: " + to, "Call-ID: " + call, "CSeq: %d %s" % (cseq, method)]
     lines += ["Route: " + value for value in routes]
     if method == "INVITE": lines.append("Contact: <sip:alice@browser.invalid;transport=ws>")
+    if method == "INVITE" and FIXTURE_CALLER_ID:
+        # The gateway must discard these fresh browser hints and retain the
+        # caller identity captured at initial admission.
+        lines += ["X-Bitcall-Caller-ID: +12025559999", "P-Asserted-Identity: <sip:forged@example.test>"]
     return "\r\n".join(lines + ["Content-Length: 0", "", ""])
 def carrier_dialog_request(method, uri, call, cseq, from_value, to_value, routes, branch=None):
     branch = branch or "z9hG4bK" + uuid.uuid4().hex
@@ -126,6 +131,14 @@ def no_more_invites(sock):
         pass
     finally:
         sock.settimeout(6)
+
+def assert_caller_identity(headers):
+    if not FIXTURE_CALLER_ID: return
+    values = "\n".join(headers.get("from", []) + headers.get("p-asserted-identity", []) + headers.get("remote-party-id", []))
+    assert FIXTURE_CALLER_ID in headers.get("from", [""])[0], headers
+    assert FIXTURE_CALLER_ID in headers.get("p-asserted-identity", [""])[0], headers
+    assert FIXTURE_CALLER_ID in headers.get("remote-party-id", [""])[0], headers
+    assert "+12025559999" not in values and "forged@example.test" not in values, headers
 
 def carrier():
     try:
@@ -177,6 +190,7 @@ def carrier():
                 line, h = parse(invite)
                 if line.startswith("INVITE ") and h["call-id"] != timeout_request_h["call-id"]: break
             dialog_call = h["call-id"][0]
+            assert_caller_identity(h)
             record_routes = "".join("Record-Route: " + value + "\r\n" for value in h.get("record-route", []))
             answer = response(invite, 200, "OK", "").decode().replace("Content-Length: 0", "Contact: <sip:provider@127.0.0.1:15060>\r\n" + record_routes + "Content-Length: 0").encode()
             sock.sendto(answer, peer)
@@ -188,6 +202,7 @@ def carrier():
             # Browser re-INVITE failure: the browser sees its original CSeq.
             reinvite, peer = sock.recvfrom(65535); reinvite = reinvite.decode(); line, reinvite_h = parse(reinvite)
             assert line.startswith("INVITE "), line
+            assert_caller_identity(reinvite_h)
             sock.sendto(response(reinvite, 488, "Not Acceptable Here", ""), peer)
             while True:
                 nack, _ = sock.recvfrom(65535); line, _ = parse(nack.decode())
@@ -197,11 +212,13 @@ def carrier():
             # Browser re-INVITE success through one upstream digest retry.
             reinvite, peer = sock.recvfrom(65535); reinvite = reinvite.decode(); line, first_reinvite_h = parse(reinvite)
             assert line.startswith("INVITE ") and "proxy-authorization" not in first_reinvite_h, line
+            assert_caller_identity(first_reinvite_h)
             sock.sendto(response(reinvite, 407, "Proxy Authentication Required", 'Proxy-Authenticate: Digest realm="carrier.example.test", nonce="dialog", qop="auth"'), peer)
             while True:
                 retry, peer = sock.recvfrom(65535); retry = retry.decode(); line, retry_h = parse(retry)
                 if line.startswith("INVITE ") and "proxy-authorization" in retry_h: break
                 assert line.startswith("ACK ") or line.startswith("SIP/2.0 100 "), line
+            assert_caller_identity(retry_h)
             answer = response(retry, 200, "OK", "").decode().replace("Content-Length: 0", "Contact: <sip:provider@127.0.0.1:15060>\r\n" + record_routes + "Content-Length: 0").encode()
             sock.sendto(answer, peer)
             while True:
@@ -209,7 +226,7 @@ def carrier():
                 if line.startswith("ACK "): break
                 assert line.startswith("SIP/2.0 100 "), line
 
-            provider_from = h["to"][0] + ("" if ";tag=" in h["to"][0] else ";tag=edge")
+            provider_from = h["to"][0] + ("" if ";tag=" in h["to"][0] else ";tag=provider-edge")
             provider_to = h["from"][0]
             browser_target = h["contact"][0].split("<", 1)[1].split(">", 1)[0]
             provider_routes = h.get("record-route", [])
@@ -422,6 +439,7 @@ def main():
     parser.add_argument("--image", required=True)
     parser.add_argument("--gateway-root", type=Path, default=root)
     parser.add_argument("--source-overlay", action="store_true")
+    parser.add_argument("--caller-id", action="store_true", help="prove captured assigned caller ID across dialog re-INVITEs")
     args = parser.parse_args()
     root = args.gateway_root.resolve()
     files = {
@@ -440,6 +458,10 @@ def main():
         fixture = snapshot()
         fixture["issuedAt"] = int(time.time())
         fixture["validUntil"] = fixture["issuedAt"] + 30
+        if args.caller_id:
+            policy = {"mode": "assigned", "allowedNumbers": ["+12025550100"], "defaultNumber": "+12025550100"}
+            for seat in fixture["seats"]:
+                seat["callerIdPolicy"] = policy.copy()
         state.write_text(json.dumps(fixture), encoding="utf-8")
         state.chmod(0o600)
         (temp / "rtpengine.conf").write_text("[rtpengine]\n")
@@ -460,7 +482,8 @@ def main():
             mounts = ["-v", f"{files['seat']}:/opt/bitcall/seat-routing.cfg:ro", "-v", f"{renderer}:/etc/cont-init.d/07-render-kamailio-cfg:ro", "-v", f"{files['compiler']}:/opt/bitcall/compile_seat_snapshot.py:ro"]
         mounts = ["-v", f"{test_config}:/etc/kamailio/kamailio.cfg:ro", *mounts]
         try:
-            run("docker", "run", "-d", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/run:rw,exec,size=128m", "--tmpfs", "/tmp:rw,size=64m", "--cpus", "1", "--memory", "512m", "--pids-limit", "256", "--security-opt", "no-new-privileges:true", "--entrypoint", "/bin/sh", "-e", "DOMAIN=query.example.test", "-e", "PRIVATE_IP=127.0.0.1", "-e", "PUBLIC_IP=127.0.0.1", "-e", "WEBPHONE_ORIGIN=https://query.example.test", "-e", "SEAT_DOMAIN=seats.example.test", "-e", "SEAT_MODE=local", "-e", f"FIXTURE_VALID_UNTIL={fixture['validUntil']}", "-e", "SEAT_SNAPSHOT_FILE=/tmp/seat-snapshot.json", "-v", f"{state}:/fixture-seats.json:ro", "-v", f"{cert}:/etc/ssl/cert.pem:ro", "-v", f"{key}:/etc/ssl/key.pem:ro", "-v", f"{temp / 'rtpengine.conf'}:/etc/rtpengine/rtpengine.conf:ro", *mounts, args.image, "-ec", "umask 077; cp /fixture-seats.json /tmp/seat-snapshot.json; exec /init")
+            caller_id_env = ["-e", "FIXTURE_CALLER_ID=+12025550100"] if args.caller_id else []
+            run("docker", "run", "-d", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/run:rw,exec,size=128m", "--tmpfs", "/tmp:rw,size=64m", "--cpus", "1", "--memory", "512m", "--pids-limit", "256", "--security-opt", "no-new-privileges:true", "--entrypoint", "/bin/sh", "-e", "DOMAIN=query.example.test", "-e", "PRIVATE_IP=127.0.0.1", "-e", "PUBLIC_IP=127.0.0.1", "-e", "WEBPHONE_ORIGIN=https://query.example.test", "-e", "SEAT_DOMAIN=seats.example.test", "-e", "SEAT_MODE=local", "-e", f"FIXTURE_VALID_UNTIL={fixture['validUntil']}", *caller_id_env, "-e", "SEAT_SNAPSHOT_FILE=/tmp/seat-snapshot.json", "-v", f"{state}:/fixture-seats.json:ro", "-v", f"{cert}:/etc/ssl/cert.pem:ro", "-v", f"{key}:/etc/ssl/key.pem:ro", "-v", f"{temp / 'rtpengine.conf'}:/etc/rtpengine/rtpengine.conf:ro", *mounts, args.image, "-ec", "umask 077; cp /fixture-seats.json /tmp/seat-snapshot.json; exec /init")
             created = True
             deadline = time.monotonic() + 35
             while True:

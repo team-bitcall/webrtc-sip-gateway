@@ -91,6 +91,19 @@ class SnapshotValidationTests(unittest.TestCase):
         data["profiles"][0]["credential"] = {"kind": "ha1", "value": "not-an-md5"}
         with self.assertRaises(SnapshotError):
             validate_snapshot(data, NOW)
+
+    def test_optional_caller_id_policy_is_strict_and_preserves_absent_behavior(self):
+        self.assertNotIn("callerIdPolicy", validate_snapshot(snapshot(), NOW)["seats"][0])
+        data = snapshot()
+        data["seats"][0]["callerIdPolicy"] = {"mode": "assigned", "allowedNumbers": ["+12025550100", "+12025550101"], "defaultNumber": "+12025550100"}
+        normalized = validate_snapshot(data, NOW)
+        self.assertEqual(normalized["seats"][0]["callerIdPolicy"]["mode"], "assigned")
+        data["seats"][0]["callerIdPolicy"]["defaultNumber"] = "+12025559999"
+        with self.assertRaises(SnapshotError): validate_snapshot(data, NOW)
+        data["seats"][0]["callerIdPolicy"] = {"mode": "flexible", "allowedNumbers": ["+12025550100"], "defaultNumber": ""}
+        with self.assertRaises(SnapshotError): validate_snapshot(data, NOW)
+        data["seats"][0]["callerIdPolicy"] = {"mode": "flexible", "allowedNumbers": [], "defaultNumber": "not-a-number"}
+        with self.assertRaises(SnapshotError): validate_snapshot(data, NOW)
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "snapshot.json"
             path.write_text('{"schemaVersion":1,"schemaVersion":1}', encoding="utf-8")
@@ -112,6 +125,13 @@ class RenderingTests(unittest.TestCase):
         self.assertIn(data["profiles"][0]["credential"]["value"].encode().hex(), rendered)
         self.assertIn("$(var(seat_value){s.decode.hexa})", rendered)
         self.assertIn("$sht(seat_users=>tenant-a::7::alice+1::enabled) = 1;", rendered)
+
+    def test_caller_id_policy_uses_individual_generation_keys(self):
+        data = snapshot()
+        data["seats"][0]["callerIdPolicy"] = {"mode": "assigned", "allowedNumbers": ["+12025550100"], "defaultNumber": "+12025550100"}
+        rendered = render_snapshot(validate_snapshot(data, NOW))
+        self.assertIn("caller_id_mode", rendered)
+        self.assertIn("caller_id_allowed::+12025550100", rendered)
 
 
 class FileSafetyTests(unittest.TestCase):

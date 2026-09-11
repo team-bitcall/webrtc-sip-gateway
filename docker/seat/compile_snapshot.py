@@ -14,6 +14,7 @@ MAX_SEATS = 10_000
 MAX_PROFILES = 1_000
 ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 USER_RE = re.compile(r"^[A-Za-z0-9+._-]{1,128}$")
+CALLER_ID_RE = re.compile(r"^\+?[0-9]{1,32}$")
 HA1_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 DNS_RE = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
@@ -32,6 +33,11 @@ def _fail(path):
 
 def _keys(value, expected, path):
     if not isinstance(value, dict) or set(value) != set(expected):
+        _fail(path)
+
+
+def _optional_keys(value, required, optional, path):
+    if not isinstance(value, dict) or not set(required) <= set(value) or not set(value) <= set(required) | set(optional):
         _fail(path)
 
 
@@ -161,7 +167,7 @@ def validate_snapshot(data, now=None):
     seats, seat_ids, usernames = [], set(), set()
     for index, item in enumerate(seats_in):
         path = "seats[%d]" % index
-        _keys(item, ("id", "tenantId", "username", "profileId", "enabled", "ha1"), path)
+        _optional_keys(item, ("id", "tenantId", "username", "profileId", "enabled", "ha1"), ("callerIdPolicy",), path)
         seat_id = _string(item["id"], path + ".id", pattern=ID_RE)
         username = _string(item["username"], path + ".username", pattern=USER_RE)
         tenant_id = _string(item["tenantId"], path + ".tenantId", pattern=ID_RE)
@@ -178,8 +184,7 @@ def validate_snapshot(data, now=None):
             _fail(path + ".ha1")
         seat_ids.add(seat_id)
         usernames.add(username)
-        seats.append(
-            {
+        seat = {
                 "id": seat_id,
                 "tenantId": tenant_id,
                 "username": username,
@@ -187,7 +192,32 @@ def validate_snapshot(data, now=None):
                 "enabled": _boolean(item["enabled"], path + ".enabled"),
                 "ha1": ha1.lower(),
             }
-        )
+        if "callerIdPolicy" in item:
+            policy = item["callerIdPolicy"]
+            _keys(policy, ("mode", "allowedNumbers", "defaultNumber"), path + ".callerIdPolicy")
+            mode = _string(policy["mode"], path + ".callerIdPolicy.mode", 16)
+            if mode not in ("assigned", "flexible"):
+                _fail(path + ".callerIdPolicy.mode")
+            allowed = policy["allowedNumbers"]
+            if not isinstance(allowed, list) or len(allowed) > 100:
+                _fail(path + ".callerIdPolicy.allowedNumbers")
+            normalized_allowed = []
+            for number_index, number in enumerate(allowed):
+                number = _string(number, path + ".callerIdPolicy.allowedNumbers[%d]" % number_index, 33, CALLER_ID_RE)
+                if number in normalized_allowed:
+                    _fail(path + ".callerIdPolicy.allowedNumbers")
+                normalized_allowed.append(number)
+            default = policy["defaultNumber"]
+            if not isinstance(default, str):
+                _fail(path + ".callerIdPolicy.defaultNumber")
+            if default and not CALLER_ID_RE.fullmatch(default):
+                _fail(path + ".callerIdPolicy.defaultNumber")
+            if mode == "assigned" and ((not normalized_allowed and default) or (default and default not in normalized_allowed)):
+                _fail(path + ".callerIdPolicy.defaultNumber")
+            if mode == "flexible" and normalized_allowed:
+                _fail(path + ".callerIdPolicy.allowedNumbers")
+            seat["callerIdPolicy"] = {"mode": mode, "allowedNumbers": normalized_allowed, "defaultNumber": default}
+        seats.append(seat)
     return {
         "revision": revision,
         "validUntil": valid_until,
@@ -224,6 +254,12 @@ def snapshot_entries(normalized, tenant_id):
         ):
             entries.append(("seat_users", seat_prefix + field, value))
         entries.append(("seat_users", seat_prefix + "enabled", int(seat["enabled"])))
+        policy = seat.get("callerIdPolicy")
+        if policy:
+            entries.append(("seat_users", seat_prefix + "caller_id_mode", policy["mode"]))
+            entries.append(("seat_users", seat_prefix + "caller_id_default", policy["defaultNumber"]))
+            for number in policy["allowedNumbers"]:
+                entries.append(("seat_users", seat_prefix + "caller_id_allowed::" + number, 1))
     for profile in normalized["profiles"]:
         if profile["tenantId"] != tenant_id:
             continue
