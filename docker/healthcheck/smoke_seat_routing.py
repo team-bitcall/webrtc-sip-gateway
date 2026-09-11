@@ -184,7 +184,8 @@ def run(*args, **kwargs):
 def diagnostic_logs(name):
     output = run("docker", "logs", "--tail", "100", name, stderr=subprocess.STDOUT)
     keep = (line for line in output.splitlines()
-            if "ERROR" in line or "CRITICAL" in line or "kamailio-cfg: invalid" in line)
+            if "ERROR" in line or "CRITICAL" in line or "kamailio-cfg: invalid" in line
+            or "invalid input file" in line)
     return "\n".join(keep)
 
 
@@ -202,8 +203,11 @@ def main():
     parser.add_argument("--image", required=True)
     parser.add_argument("--gateway-root", type=Path, default=root)
     parser.add_argument("--source-overlay", action="store_true")
+    parser.add_argument("--managed", action="store_true", help="exercise private control provisioning before and after the same calls")
     args = parser.parse_args()
     root = args.gateway_root.resolve()
+    if args.managed and args.source_overlay:
+        parser.error("managed mode validates the packaged image only")
     files = {"config": root / "docker/kamailio/kamailio.cfg", "seat config": root / "docker/kamailio/seat-routing.cfg", "renderer": root / "docker/rootfs/etc/cont-init.d/07-render-kamailio-cfg", "compiler": root / "docker/seat/compile_snapshot.py"}
     if args.source_overlay and any(not path.is_file() for path in files.values()):
         parser.error("source overlay is incomplete")
@@ -220,9 +224,15 @@ def main():
             renderer_copy.chmod(0o755)
         mounts = []
         if args.source_overlay:
-            mounts = ["-v", f"{files['config']}:/etc/kamailio/kamailio.cfg:ro", "-v", f"{files['seat config']}:/etc/kamailio/seat-routing.cfg:ro", "-v", f"{renderer_copy}:/etc/cont-init.d/07-render-kamailio-cfg:ro", "-v", f"{files['compiler']}:/opt/bitcall/compile_seat_snapshot.py:ro"]
+            mounts = ["-v", f"{files['config']}:/etc/kamailio/kamailio.cfg:ro", "-v", f"{files['seat config']}:/opt/bitcall/seat-routing.cfg:ro", "-v", f"{renderer_copy}:/etc/cont-init.d/07-render-kamailio-cfg:ro", "-v", f"{files['compiler']}:/opt/bitcall/compile_seat_snapshot.py:ro"]
+        mode = "managed" if args.managed else "local"
+        control_env = ["-e", "SEAT_CONTROL_TOKEN=" + "a" * 43, "-e", "SEAT_STATE_DIR=/var/lib/bitcall-seat", "--mount", f"type=volume,source={name}-state,target=/var/lib/bitcall-seat"] if args.managed else []
+        initialize = "umask 077; cp /fixture-seats.json /tmp/seat-snapshot.json; "
+        if args.managed:
+            initialize += "chmod 700 /var/lib/bitcall-seat; "
+        initialize += "exec /init"
         try:
-            run("docker", "run", "-d", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/run:rw,exec,size=128m", "--tmpfs", "/tmp:rw,size=64m", "--cpus", "1", "--memory", "512m", "--pids-limit", "256", "--security-opt", "no-new-privileges:true", "-e", "DOMAIN=query.example.test", "-e", "PRIVATE_IP=127.0.0.1", "-e", "PUBLIC_IP=127.0.0.1", "-e", "WEBPHONE_ORIGIN=https://query.example.test", "-e", "SEAT_DOMAIN=seats.example.test", "-e", "SEAT_MODE=local", "-e", "SEAT_SNAPSHOT_FILE=/etc/bitcall/seats.json", "-v", f"{state}:/etc/bitcall/seats.json:ro", "-v", f"{cert}:/etc/ssl/cert.pem:ro", "-v", f"{key}:/etc/ssl/key.pem:ro", "-v", f"{temp / 'rtpengine.conf'}:/etc/rtpengine/rtpengine.conf:ro", *mounts, args.image)
+            run("docker", "run", "-d", "--name", name, "--network", "none", "--read-only", "--tmpfs", "/run:rw,exec,size=128m", "--tmpfs", "/tmp:rw,size=64m", "--cpus", "1", "--memory", "512m", "--pids-limit", "256", "--security-opt", "no-new-privileges:true", "--entrypoint", "/bin/sh", "-e", "DOMAIN=query.example.test", "-e", "PRIVATE_IP=127.0.0.1", "-e", "PUBLIC_IP=127.0.0.1", "-e", "WEBPHONE_ORIGIN=https://query.example.test", "-e", "SEAT_DOMAIN=seats.example.test", "-e", "SEAT_MODE=" + mode, *control_env, "-e", "SEAT_SNAPSHOT_FILE=/tmp/seat-snapshot.json", "-v", f"{state}:/fixture-seats.json:ro", "-v", f"{cert}:/etc/ssl/cert.pem:ro", "-v", f"{key}:/etc/ssl/key.pem:ro", "-v", f"{temp / 'rtpengine.conf'}:/etc/rtpengine/rtpengine.conf:ro", *mounts, args.image, "-ec", initialize)
             created = True; deadline = time.monotonic() + 35
             while True:
                 try:
@@ -230,7 +240,11 @@ def main():
                 except subprocess.CalledProcessError:
                     if time.monotonic() >= deadline: raise RuntimeError("gateway did not become ready")
                     time.sleep(.5)
-            print(run("docker", "exec", "-i", name, "python3", "-", input=IN_CONTAINER_TEST, timeout=25).strip())
+            scenario = IN_CONTAINER_TEST
+            if args.managed:
+                from managed_seat_scenario import BEFORE_CALLS, AFTER_CALLS
+                scenario = BEFORE_CALLS + scenario + AFTER_CALLS
+            print(run("docker", "exec", "-i", name, "python3", "-", input=scenario, timeout=45).strip())
         except Exception:
             if created:
                 diagnostics = diagnostic_logs(name)
@@ -239,6 +253,8 @@ def main():
             raise
         finally:
             if created: run("docker", "rm", "-f", name, stderr=subprocess.DEVNULL)
+            if args.managed:
+                subprocess.run(["docker", "volume", "rm", name + "-state"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
 if __name__ == "__main__": main()

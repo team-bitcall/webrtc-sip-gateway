@@ -32,6 +32,8 @@ patch_substdef "WEBPHONE_ORIGIN" "$(escape_substdef_value "${WEBPHONE_ORIGIN:-*}
 patch_substdef "INTERNAL_WSS_PORT" "${INTERNAL_WSS_PORT:-8443}"
 
 sed -i 's|/etc/kamailio/tls.cfg|/run/kamailio/tls.cfg|' "$CFG"
+# Preserve mounted operator config, upgrading the pre-release include location.
+sed -i 's|/etc/kamailio/seat-routing.cfg|/opt/bitcall/seat-routing.cfg|' "$CFG"
 
 case "${SEAT_MODE:-disabled}" in
   disabled) ;;
@@ -43,6 +45,13 @@ case "${SEAT_MODE:-disabled}" in
       --input "${SEAT_SNAPSHOT_FILE:-/etc/bitcall/seats.json}" \
       --output /run/kamailio/seat-snapshot.cfg --expected-domain "$SEAT_DOMAIN"
     sed -i '1a #!define WITH_SEAT_MODE' "$CFG"
+    ;;
+  managed)
+    # Start with no seat authority. The durable helper reconciles unexpired
+    # accepted state through its private socket once Kamailio is ready.
+    umask 077
+    python3 /opt/bitcall/seat/provisioning.py --init
+    sed -i '1a #!define WITH_SEAT_MODE\n#!define WITH_SEAT_CONTROL' "$CFG"
     ;;
   *) echo 'kamailio-cfg: invalid SEAT_MODE' >&2; exit 1 ;;
 esac

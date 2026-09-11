@@ -1,0 +1,6 @@
+#!/command/with-contenv sh
+set -eu
+if [ "${SEAT_MODE:-disabled}" != managed ]; then
+  exec sleep infinity
+fi
+exec python3 /opt/bitcall/seat/provisioning.py

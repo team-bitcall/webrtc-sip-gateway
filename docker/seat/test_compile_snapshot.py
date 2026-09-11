@@ -111,7 +111,7 @@ class RenderingTests(unittest.TestCase):
         self.assertNotIn('p"; $sht(evil', rendered)
         self.assertIn(data["profiles"][0]["credential"]["value"].encode().hex(), rendered)
         self.assertIn("$(var(seat_value){s.decode.hexa})", rendered)
-        self.assertIn("$sht(seat_users=>alice+1::enabled) = 1;", rendered)
+        self.assertIn("$sht(seat_users=>tenant-a::7::alice+1::enabled) = 1;", rendered)
 
 
 class FileSafetyTests(unittest.TestCase):

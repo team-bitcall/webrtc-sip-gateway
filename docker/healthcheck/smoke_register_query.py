@@ -9,6 +9,7 @@ The fixture uses only loopback and generated identities. It proves that:
 """
 
 import argparse
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -224,6 +225,30 @@ def run(*args, **kwargs):
     return subprocess.check_output(args, text=True, **kwargs)
 
 
+def seat_snapshot(now):
+    """A valid but unrelated local-seat realm for legacy-routing isolation."""
+    return {
+        "schemaVersion": 1,
+        "revision": 1,
+        "issuedAt": now,
+        "validUntil": now + 240,
+        "domain": "seats.query.invalid",
+        "profiles": [{
+            "id": "fixture-profile", "tenantId": "fixture-tenant", "enabled": True,
+            "username": "fixture-upstream", "realm": "carrier.invalid",
+            "requestDomain": "carrier.invalid",
+            "outboundProxy": "sip:127.0.0.1:15060;transport=udp",
+            "credential": {"kind": "password", "value": "fixture-password"},
+            "fromUser": "fixture-upstream",
+        }],
+        "seats": [{
+            "id": "fixture-seat", "tenantId": "fixture-tenant", "username": "fixture-seat",
+            "profileId": "fixture-profile", "enabled": False,
+            "ha1": "0123456789abcdef0123456789abcdef",
+        }],
+    }
+
+
 def main():
     default_root = Path(__file__).resolve().parents[2]
     parser = argparse.ArgumentParser(description=__doc__)
@@ -231,6 +256,8 @@ def main():
     parser.add_argument("--gateway-root", type=Path, default=default_root)
     parser.add_argument("--source-overlay", action="store_true",
                         help="Mount checkout Kamailio config over an older image")
+    parser.add_argument("--seat-mode", action="store_true",
+                        help="Enable an unrelated local-seat realm during this legacy test")
     args = parser.parse_args()
     config = args.gateway_root.resolve() / "docker/kamailio/kamailio.cfg"
     if args.source_overlay and not config.is_file():
@@ -245,11 +272,23 @@ def main():
         cert, key = tmp / "cert.pem", tmp / "key.pem"
         rtp_config = tmp / "rtpengine.conf"
         rtp_config.write_text("[rtpengine]\n")
+        state = tmp / "fixture-seats.json"
+        if args.seat_mode:
+            state.write_text(json.dumps(seat_snapshot(int(time.time()))), encoding="utf-8")
+            state.chmod(0o600)
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1",
             "-nodes", "-subj", "/CN=query.example.test",
             "-addext", "subjectAltName=DNS:query.example.test",
             "-keyout", str(key), "-out", str(cert), stderr=subprocess.DEVNULL)
         try:
+            command = []
+            seat_args = []
+            if args.seat_mode:
+                seat_args = ["--entrypoint", "/bin/sh", "-e", "SEAT_MODE=local",
+                             "-e", "SEAT_DOMAIN=seats.query.invalid",
+                             "-e", "SEAT_SNAPSHOT_FILE=/tmp/seat-snapshot.json",
+                             "-v", f"{state}:/fixture-seats.json:ro"]
+                command = ["-ec", "umask 077; cp /fixture-seats.json /tmp/seat-snapshot.json; exec /init"]
             run("docker", "run", "-d", "--name", name, "--network", "none",
                 "--read-only", "--tmpfs", "/run:rw,exec,size=128m",
                 "--tmpfs", "/tmp:rw,size=64m", "--cpus", "1", "--memory", "512m",
@@ -261,7 +300,7 @@ def main():
                 "-e", "WEBPHONE_ORIGIN=https://query.example.test",
                 "-v", f"{cert}:/etc/ssl/cert.pem:ro", "-v", f"{key}:/etc/ssl/key.pem:ro",
                 "-v", f"{rtp_config}:/etc/rtpengine/rtpengine.conf:ro",
-                *source_mount, args.image)
+                *seat_args, *source_mount, args.image, *command)
             created = True
             deadline = time.monotonic() + 35
             while True:

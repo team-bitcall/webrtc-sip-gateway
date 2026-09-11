@@ -70,6 +70,15 @@ jobs:
       - name: Local seats and shared upstream authenticated calls
         run: python3 docker/healthcheck/smoke_seat_routing.py --image webrtc-sip-gateway:ci
 
+      - name: Seat call cancellation and upstream failure handling
+        run: python3 docker/healthcheck/seat_dialog_fixture.py --image webrtc-sip-gateway:ci
+
+      - name: Legacy registration with local seats and no control backend
+        run: python3 docker/healthcheck/smoke_register_query.py --image webrtc-sip-gateway:ci --seat-mode
+
+      - name: Managed seat provisioning, revocation and rotation
+        run: python3 docker/healthcheck/smoke_seat_routing.py --image webrtc-sip-gateway:ci --managed
+
       - name: Browser DTLS role stays passive from offer through answer
         run: python3 docker/healthcheck/smoke_dtls_role.py --image webrtc-sip-gateway:ci
 
