@@ -48,8 +48,9 @@ COPY kamailio/kamailio.cfg /etc/kamailio/kamailio.cfg
 # The base image persists /etc/kamailio. Ship routing code outside that volume
 # so an existing installation cannot mask it with an older anonymous volume.
 COPY kamailio/seat-routing.cfg /opt/bitcall/seat-routing.cfg
+COPY kamailio/call-events.cfg /opt/bitcall/call-events.cfg
 COPY seat/compile_snapshot.py /opt/bitcall/compile_seat_snapshot.py
-COPY seat/compile_snapshot.py seat/provisioning.py /opt/bitcall/seat/
+COPY seat/compile_snapshot.py seat/call_journal.py seat/provisioning.py /opt/bitcall/seat/
 COPY kamailio/tls.cfg /etc/kamailio/tls.cfg
 COPY healthcheck/healthcheck_server.py /opt/bitcall/healthcheck_server.py
 COPY rootfs/ /

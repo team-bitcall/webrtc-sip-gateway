@@ -56,4 +56,16 @@ case "${SEAT_MODE:-disabled}" in
   *) echo 'kamailio-cfg: invalid SEAT_MODE' >&2; exit 1 ;;
 esac
 
+case "${SEAT_CALL_EVENTS:-0}" in
+  0) ;;
+  1)
+    if [ "${SEAT_MODE:-disabled}" != managed ]; then
+      echo 'kamailio-cfg: call events require managed seats and durable state' >&2
+      exit 1
+    fi
+    sed -i '1a #!define WITH_SEAT_CALL_EVENTS' "$CFG"
+    ;;
+  *) echo 'kamailio-cfg: invalid SEAT_CALL_EVENTS' >&2; exit 1 ;;
+esac
+
 echo "kamailio-cfg: rendered with DOMAIN=${DOMAIN:-localhost}"

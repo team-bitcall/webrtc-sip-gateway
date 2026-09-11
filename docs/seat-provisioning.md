@@ -119,3 +119,51 @@ empty module-init route. These checks used isolated fixtures, not customer activ
 Legacy coexistence and actual provider/media results are recorded in the webphone
 repository's task 08 verification record. The existing backend-to-browser handoff
 has its own task 09 acceptance record there.
+
+## Managed call-event journal (Task 11 foundation)
+
+`SEAT_CALL_EVENTS=1` is intended only for managed seat mode with the existing
+private durable state mount. It keeps an independent SQLite WAL journal beside,
+but separate from, snapshot projection state. The helper exposes a loopback-only
+append listener on `127.0.0.1:8882`; Kamailio admission must receive its durable
+acknowledgement before forwarding a new initial call. Existing dialogs continue
+when journal delivery later becomes unavailable.
+
+The external control bearer can read one projected tenant at a time with
+`GET /v1/tenants/t_<hash>/call-events?after=<sequence>&limit=<1..100>` and ack
+only durable backend persistence with `POST .../call-events/ack` and
+`{"throughSequence": n}`. Events are ordered by a gateway-durable global
+sequence and are replay-safe. The journal stores only gateway-attributed IDs,
+call timing, destination, caller-ID decision, SIP outcome and normalized
+termination evidence; it never stores credentials or raw SIP headers. Call
+matching to Sippy/PSTN and production retention policy remain deferred.
+
+The event feature defaults off. It requires projected tenant/seat IDs (`t_`/`s_`
+followed by 64 lowercase hexadecimal characters), as sent by the webphone backend.
+The existing SIP-worker HTTP timeout remains two seconds; the append target is
+local, never the remote backend. A failed admission returns 503; failed lifecycle
+appends log a fixed diagnostic without exposing call payloads or credentials.
+
+The queue holds at most 10,000 unacknowledged events and reserves the last 100
+slots for terminal observations. Admission and nonterminal appends stop at 9,900.
+`GET /v1/call-events/health` on the existing authenticated control surface reports
+pending count, capacity and readiness. Acknowledged terminal evidence stays for
+seven days before compaction; repeated acknowledgements do not extend that time.
+Unacknowledged evidence is never removed by this compaction.
+
+The private dialog inventory reconciles orphaned calls after a ten-second grace
+period. Missing dialogs produce uncertain evidence, never an invented exact end.
+Unknown, unavailable or truncated inventories cannot declare calls ended. Database
+and backup sizing, retention policy and alerting remain production rollout gates.
+
+The packaged managed fixture verifies two answered calls with assigned/flexible
+caller IDs and password/HA1 upstream auth, plus ringing/busy/rejected/no-answer
+events. Its optional export joins directly to the backend validation script:
+
+```sh
+python3 docker/healthcheck/smoke_seat_routing.py --image bitcall-gateway:seat-development --managed --call-events --events-output /tmp/call-events.json
+```
+
+On 2026-09-11 the Task 11 DEV candidate passed this fixture (15 events, five calls),
+active-dialog RPC inspection and 27 focused gateway tests. Customer activation
+stays disabled. The webphone repository records the matching backend acceptance.

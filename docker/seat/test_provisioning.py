@@ -5,12 +5,20 @@ import http.server
 import json
 import os
 from pathlib import Path
+import socket
 import tempfile
 import threading
 import unittest
 
 from compile_snapshot import snapshot_entries, validate_snapshot
-from provisioning import ControlError, ControlHandler, TenantProjectionStore, canonical_json, durable_state_directory
+from provisioning import (
+    ControlError,
+    ControlHandler,
+    KamailioRpc,
+    TenantProjectionStore,
+    canonical_json,
+    durable_state_directory,
+)
 from test_compile_snapshot import NOW, snapshot
 
 
@@ -166,6 +174,63 @@ class ProjectionTests(unittest.TestCase):
                 durable_state_directory(path, mounts)
         mounts = f"30 1 8:1 /volumes/seat {self.temp.name} rw - ext4 /dev/sda1 rw"
         self.assertEqual(str(durable_state_directory(self.temp.name, mounts)), self.temp.name)
+
+
+class DialogInventoryTests(unittest.TestCase):
+    class Rpc(KamailioRpc):
+        def __init__(self, result):
+            self.result = result
+            self.inventory = None
+
+        def call(self, method, *params, inventory=False):
+            if method != "dlg.list_ctx" or params:
+                raise AssertionError("unexpected dialog inventory RPC")
+            self.inventory = inventory
+            return self.result
+
+    class ReplySocket:
+        def __init__(self, flags):
+            self.flags = flags
+
+        def recvmsg(self, size):
+            self.size = size
+            return b'{"result":[]}', [], self.flags, None
+
+        def recv(self, size):
+            self.size = size
+            return b'{"result":[]}'
+
+    def test_dialog_context_array_extracts_only_valid_cdr_ids(self):
+        call_id = "a" * 32
+        rpc = self.Rpc([
+            {"variables": [{"unrelated": "ignored"}, {"seat_cdr_id": call_id}]},
+            {"variables": []},
+        ])
+        self.assertEqual(rpc.active_cdr_ids(), {call_id})
+        self.assertTrue(rpc.inventory)
+
+    def test_empty_inventory_is_authoritative_and_bad_shapes_are_unavailable(self):
+        self.assertEqual(self.Rpc([]).active_cdr_ids(), set())
+        for result in (
+            {},
+            [{"variables": {}}],
+            [{"variables": ["bad"]}],
+            [{"variables": [{"seat_cdr_id": "not-a-call-id"}]}],
+        ):
+            with self.assertRaises(ControlError) as error:
+                self.Rpc(result).active_cdr_ids()
+            self.assertEqual(error.exception.code, "GATEWAY_STATE_UNAVAILABLE")
+
+    def test_truncated_inventory_is_rejected_before_json_decode(self):
+        client = self.ReplySocket(socket.MSG_TRUNC)
+        with self.assertRaises(OSError):
+            KamailioRpc._receive_reply(client, inventory=True)
+        self.assertEqual(client.size, 1024 * 1024)
+
+    def test_ordinary_rpc_replies_keep_small_bounded_receive(self):
+        client = self.ReplySocket(0)
+        self.assertEqual(KamailioRpc._receive_reply(client, inventory=False), b'{"result":[]}')
+        self.assertEqual(client.size, 16384)
 
 
 class HttpContractTests(unittest.TestCase):

@@ -82,6 +82,9 @@ jobs:
       - name: Managed seat provisioning, revocation and rotation
         run: python3 docker/healthcheck/smoke_seat_routing.py --image webrtc-sip-gateway:ci --managed
 
+      - name: Durable per-agent call events and terminal outcomes
+        run: python3 docker/healthcheck/smoke_seat_routing.py --image webrtc-sip-gateway:ci --managed --call-events
+
       - name: Browser DTLS role stays passive from offer through answer
         run: python3 docker/healthcheck/smoke_dtls_role.py --image webrtc-sip-gateway:ci
 

@@ -15,8 +15,10 @@ import stat
 import sys
 import threading
 import time
+import urllib.parse
 import uuid
 
+from call_journal import CallJournal, JournalError
 from compile_snapshot import (ID_RE, MAX_BYTES, SnapshotError, _atomic_write, _dns,
                               _no_duplicate_keys, snapshot_entries, validate_snapshot)
 
@@ -63,7 +65,17 @@ class KamailioRpc:
     def __init__(self, path="/run/kamailio/seat-rpc.sock"):
         self.path = path
 
-    def call(self, method, *params):
+    @staticmethod
+    def _receive_reply(client, inventory):
+        """Receive a normal RPC response or one complete dialog inventory."""
+        if not inventory:
+            return client.recv(16384)
+        reply, _ancillary, flags, _address = client.recvmsg(1024 * 1024)
+        if flags & socket.MSG_TRUNC:
+            raise OSError("truncated private RPC inventory")
+        return reply
+
+    def call(self, method, *params, inventory=False):
         client_path = str(Path(self.path).parent / ("rpc-" + uuid.uuid4().hex))
         try:
             info = os.lstat(self.path)
@@ -77,7 +89,7 @@ class KamailioRpc:
                 client.connect(self.path)
                 client.send(canonical_json({"jsonrpc": "2.0", "id": request_id,
                                            "method": method, "params": list(params)}).encode())
-                reply = json.loads(client.recv(16384))
+                reply = json.loads(self._receive_reply(client, inventory))
             if reply.get("id") != request_id or "error" in reply:
                 # Missing keys are the only expected RPC error. Other errors
                 # (including failed writes) must never be acknowledged as applied.
@@ -105,6 +117,28 @@ class KamailioRpc:
 
     def set(self, table, key, value):
         self.call("htable.seti" if type(value) is int else "htable.sets", table, key, value)
+
+    def active_cdr_ids(self):
+        """Read only the CDR IDs from a complete private dialog inventory."""
+        result = self.call("dlg.list_ctx", inventory=True)
+        # dialog:dlg.list_ctx is RPC_RET_ARRAY.  Every dialog's context is
+        # printed as a ``variables`` array of one-key objects.
+        if not isinstance(result, list):
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        ids = set()
+        for dialog in result:
+            if not isinstance(dialog, dict) or not isinstance(dialog.get("variables"), list):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            for variable in dialog["variables"]:
+                if not isinstance(variable, dict):
+                    raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+                if "seat_cdr_id" not in variable:
+                    continue
+                value = variable["seat_cdr_id"]
+                if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{32}", value):
+                    raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+                ids.add(value)
+        return ids
 
 
 class TenantProjectionStore:
@@ -265,7 +299,42 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self.headers.get("Authorization", "").encode(), ("Bearer " + self.server.token).encode()
         ):
             raise ControlError(401, "UNAUTHORIZED")
-        match = re.fullmatch(r"/v1/tenants/([A-Za-z0-9._-]{1,128})/(snapshot|status)", self.path)
+        path, _, query = self.path.partition("?")
+        if path == "/v1/call-events/health" and self.command == "GET":
+            if self.server.journal is None: raise ControlError(404, "NOT_FOUND")
+            return self.server.journal.health()
+        match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/call-events", path)
+        if match and self.command == "GET":
+            if self.server.journal is None: raise ControlError(404, "NOT_FOUND")
+            try:
+                values = urllib.parse.parse_qs(query, strict_parsing=True)
+                if set(values) - {"after", "limit"} or len(values.get("after", [""])) > 1 or len(values.get("limit", [""])) > 1:
+                    raise ValueError("duplicate or unknown query")
+                after = int(values.get("after", ["0"])[0])
+                limit = int(values.get("limit", ["100"])[0])
+            except ValueError as error:
+                raise ControlError(400, "INVALID_CALL_EVENT") from error
+            if len(values.get("after", [""])) > 1 or len(values.get("limit", [""])) > 1:
+                raise ControlError(400, "INVALID_CALL_EVENT")
+            return self.server.journal.events(match.group(1), after, limit)
+        match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/call-events/ack", path)
+        if match and self.command == "POST":
+            if self.server.journal is None: raise ControlError(404, "NOT_FOUND")
+            lengths = self.headers.get_all("Content-Length", [])
+            if self.headers.get("Transfer-Encoding") is not None or self.headers.get_content_type() != "application/json" \
+                    or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,4}", lengths[0]):
+                raise ControlError(400, "INVALID_CALL_EVENT")
+            try:
+                length = int(lengths[0])
+                if length < 2 or length > 1024: raise ValueError("invalid ack length")
+                body = json.loads(self.rfile.read(length).decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+                if not isinstance(body, dict) or set(body) != {"throughSequence"}:
+                    raise ValueError("invalid ack")
+                return self.server.journal.acknowledge(match.group(1), body["throughSequence"])
+            except (ValueError, UnicodeError, JournalError) as error:
+                if isinstance(error, JournalError): raise ControlError(error.status, error.code)
+                raise ControlError(400, "INVALID_CALL_EVENT") from error
+        match = re.fullmatch(r"/v1/tenants/([A-Za-z0-9._-]{1,128})/(snapshot|status)", path)
         if not match:
             raise ControlError(404, "NOT_FOUND")
         tenant, action = match.groups()
@@ -296,10 +365,57 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
             self._reply(200, self._dispatch())
         except ControlError as error:
             self._reply(error.status, {"error": {"code": error.code}})
+        except JournalError as error:
+            self._reply(error.status, {"error": {"code": error.code}})
         except (OSError, sqlite3.Error):
             self._reply(503, {"error": {"code": "CONTROL_UNAVAILABLE"}})
 
     do_GET = do_POST = do_PUT = do_DELETE = do_OPTIONS = _handle
+
+
+class JournalHandler(http.server.BaseHTTPRequestHandler):
+    """Separate loopback-only append surface used by Kamailio, never externally exposed."""
+    server_version = "BitcallJournal"
+    def log_message(self, *_args):
+        pass
+    def _reply(self, status, value):
+        body = canonical_json(value).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Cache-Control", "private, no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_POST(self):
+        try:
+            if len(self.headers.get_all("Authorization", [])) != 1 or not hmac.compare_digest(
+                    self.headers.get("Authorization", "").encode(), ("Bearer " + self.server.token).encode()):
+                raise ControlError(401, "UNAUTHORIZED")
+            lengths = self.headers.get_all("Content-Length", [])
+            if self.headers.get("Transfer-Encoding") is not None or len(lengths) != 1:
+                raise ControlError(400, "INVALID_CALL_EVENT")
+            if self.headers.get_content_type() != "application/json":
+                raise ControlError(415, "JSON_REQUIRED")
+            length = int(lengths[0])
+            if not 2 <= length <= 4096:
+                raise ControlError(400, "INVALID_CALL_EVENT")
+            body = json.loads(self.rfile.read(length).decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+            if self.path == "/v1/call-events/admit":
+                _context, call_id = self.server.journal.admit(body)
+                result = {"schemaVersion": 1, "callId": call_id}
+            elif self.path == "/v1/call-events/append":
+                result = self.server.journal.append(body)
+            else:
+                raise ControlError(404, "NOT_FOUND")
+            self._reply(200, result)
+        except JournalError as error:
+            self._reply(error.status, {"error": {"code": error.code}})
+        except ControlError as error:
+            self._reply(error.status, {"error": {"code": error.code}})
+        except (ValueError, UnicodeError):
+            self._reply(400, {"error": {"code": "INVALID_CALL_EVENT"}})
+        except (OSError, sqlite3.Error):
+            self._reply(503, {"error": {"code": "CONTROL_UNAVAILABLE"}})
 
 
 def main():
@@ -324,8 +440,10 @@ def main():
         return 0
     store = TenantProjectionStore(directory,
                                   os.environ.get("SEAT_DOMAIN", ""), KamailioRpc())
+    events_enabled = os.environ.get("SEAT_CALL_EVENTS") == "1"
+    journal = CallJournal(directory) if events_enabled else None
     server = http.server.HTTPServer((host, int(os.environ.get("SEAT_CONTROL_PORT", "8881"))), ControlHandler)
-    server.store, server.token = store, token
+    server.store, server.journal, server.token = store, journal, token
     if tls_cert and tls_key:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2
@@ -337,19 +455,33 @@ def main():
         while not stopped.is_set():
             try:
                 store.reconcile()
-            except (ControlError, sqlite3.Error):
+                if journal:
+                    # Never infer a terminal event from helper restart or RPC
+                    # failure. Only a complete private dialog inventory is used.
+                    journal.reconcile_active(store.rpc.active_cdr_ids())
+                    journal.compact()
+            except (ControlError, JournalError, sqlite3.Error):
                 pass  # Leases expire in the SIP path even if this helper is down.
             stopped.wait(2)
 
     worker = threading.Thread(target=reconcile, daemon=True)
     worker.start()
+    journal_server = journal_worker = None
+    if journal:
+        journal_server = http.server.ThreadingHTTPServer(("127.0.0.1", 8882), JournalHandler)
+        journal_server.journal, journal_server.token = journal, token
+        journal_worker = threading.Thread(target=journal_server.serve_forever, daemon=True)
+        journal_worker.start()
     try:
         server.serve_forever()
     finally:
         stopped.set()
         worker.join(3)
+        if journal_server:
+            journal_server.shutdown(); journal_worker.join(3); journal_server.server_close()
         server.server_close()
         store.close()
+        if journal: journal.close()
     return 0
 
 

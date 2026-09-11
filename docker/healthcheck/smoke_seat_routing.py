@@ -189,6 +189,11 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
         to = reply_headers["to"][0]
         routes = list(reversed(reply_headers["record-route"]))
         send_frame(ws, dialog_request("ACK", target, user, cseq + 3, call, to, routes))
+        if os.environ.get("SEAT_CALL_EVENTS") == "1":
+            import sys
+            sys.path.insert(0, "/opt/bitcall/seat")
+            from provisioning import KamailioRpc
+            assert KamailioRpc().active_cdr_ids(), "active dialog inventory lost its journal ID"
         send_frame(ws, dialog_request("BYE", target, user, cseq + 4, call, to, routes))
         status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
 t.join(3); assert not t.is_alive(), "carrier did not complete"
@@ -233,10 +238,16 @@ def main():
     parser.add_argument("--gateway-root", type=Path, default=root)
     parser.add_argument("--source-overlay", action="store_true")
     parser.add_argument("--managed", action="store_true", help="exercise private control provisioning before and after the same calls")
+    parser.add_argument("--call-events", action="store_true", help="assert managed call-event journaling through the private control API")
+    parser.add_argument("--events-output", type=Path, help="save synthetic exported events for backend contract validation")
     args = parser.parse_args()
     root = args.gateway_root.resolve()
     if args.managed and args.source_overlay:
         parser.error("managed mode validates the packaged image only")
+    if args.call_events and not args.managed:
+        parser.error("call events require --managed")
+    if args.events_output and not args.call_events:
+        parser.error("events output requires --call-events")
     files = {"config": root / "docker/kamailio/kamailio.cfg", "seat config": root / "docker/kamailio/seat-routing.cfg", "renderer": root / "docker/rootfs/etc/cont-init.d/07-render-kamailio-cfg", "compiler": root / "docker/seat/compile_snapshot.py"}
     if args.source_overlay and any(not path.is_file() for path in files.values()):
         parser.error("source overlay is incomplete")
@@ -244,7 +255,16 @@ def main():
     created = False
     with tempfile.TemporaryDirectory(prefix="bitcall-seat-routing-") as temp:
         temp = Path(temp); cert, key, state = temp / "cert.pem", temp / "key.pem", temp / "seats.json"
-        state.write_text(json.dumps(snapshot(caller_ids=True)), encoding="utf-8"); state.chmod(0o600)
+        fixture = snapshot(caller_ids=True)
+        if args.call_events:
+            # Managed webphone snapshots use projected identifiers. Keep the
+            # standalone gateway fixtures' existing generic IDs unchanged.
+            import hashlib
+            for item in fixture["profiles"] + fixture["seats"]:
+                item["tenantId"] = "t_" + hashlib.sha256(b"tenant-a").hexdigest()
+            for seat in fixture["seats"]:
+                seat["id"] = "s_" + hashlib.sha256(seat["id"].encode()).hexdigest()
+        state.write_text(json.dumps(fixture), encoding="utf-8"); state.chmod(0o600)
         (temp / "rtpengine.conf").write_text("[rtpengine]\n")
         run("openssl", "req", "-x509", "-newkey", "rsa:2048", "-sha256", "-days", "1", "-nodes", "-subj", "/CN=query.example.test", "-addext", "subjectAltName=DNS:query.example.test", "-keyout", str(key), "-out", str(cert), stderr=subprocess.DEVNULL)
         renderer_copy = temp / "07-render-kamailio-cfg"
@@ -256,6 +276,8 @@ def main():
             mounts = ["-v", f"{files['config']}:/etc/kamailio/kamailio.cfg:ro", "-v", f"{files['seat config']}:/opt/bitcall/seat-routing.cfg:ro", "-v", f"{renderer_copy}:/etc/cont-init.d/07-render-kamailio-cfg:ro", "-v", f"{files['compiler']}:/opt/bitcall/compile_seat_snapshot.py:ro"]
         mode = "managed" if args.managed else "local"
         control_env = ["-e", "SEAT_CONTROL_TOKEN=" + "a" * 43, "-e", "SEAT_STATE_DIR=/var/lib/bitcall-seat", "--mount", f"type=volume,source={name}-state,target=/var/lib/bitcall-seat"] if args.managed else []
+        if args.call_events:
+            control_env += ["-e", "SEAT_CALL_EVENTS=1"]
         initialize = "umask 077; cp /fixture-seats.json /tmp/seat-snapshot.json; "
         if args.managed:
             initialize += "chmod 700 /var/lib/bitcall-seat; "
@@ -272,8 +294,15 @@ def main():
             scenario = IN_CONTAINER_TEST
             if args.managed:
                 from managed_seat_scenario import BEFORE_CALLS, AFTER_CALLS
-                scenario = BEFORE_CALLS + scenario + AFTER_CALLS
+                scenario = BEFORE_CALLS + scenario
+                if args.call_events:
+                    from managed_seat_scenario import CALL_EVENTS, CALL_EVENT_FAILURES
+                    scenario += CALL_EVENT_FAILURES + AFTER_CALLS + CALL_EVENTS
+                else:
+                    scenario += AFTER_CALLS
             print(run("docker", "exec", "-i", name, "python3", "-", input=scenario, timeout=45).strip())
+            if args.events_output:
+                args.events_output.write_text(run("docker", "exec", name, "cat", "/tmp/call-events.json"), encoding="utf-8")
         except Exception:
             if created:
                 diagnostics = diagnostic_logs(name)
