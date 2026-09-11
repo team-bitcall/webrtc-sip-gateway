@@ -15,7 +15,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: TURN credential contract
+      - name: TURN and media helper contracts
         run: python3 -m unittest discover -s docker/healthcheck -p 'test_*.py'
 
       - name: Protected seat snapshot contract
@@ -87,6 +87,14 @@ jobs:
 
       - name: Browser DTLS role stays passive from offer through answer
         run: python3 docker/healthcheck/smoke_dtls_role.py --image webrtc-sip-gateway:ci
+
+      - name: Media recording and subscription capabilities
+        run: |
+          docker build --build-arg GATEWAY_IMAGE=webrtc-sip-gateway:ci \
+            -t webrtc-sip-gateway:media-proof \
+            -f docker/healthcheck/media/Dockerfile docker/healthcheck/media
+          python3 docker/healthcheck/smoke_media_capabilities.py \
+            --image webrtc-sip-gateway:media-proof
 
       - name: Generate temporary TLS cert for runtime tests
         run: |
