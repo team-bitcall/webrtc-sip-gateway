@@ -70,11 +70,13 @@ with socket.create_connection(("127.0.0.1", 443), timeout=8) as raw:
     headers = b""
     while b"\r\n\r\n" not in headers: headers += exact(ws, 1)
     assert b" 101 " in headers.split(b"\r\n", 1)[0]
-    for index, (code, reason, _) in enumerate(failure_codes):
+    for index, (code, _, reason) in enumerate(failure_codes):
         call = uuid.uuid4().hex + "@phone.invalid"
         status, _ = challenged("INVITE", "sip:18005550100@" + SEAT_DOMAIN, "alice", LOCAL_PASSWORD, 200 + index * 10, call,
                               extra=("Contact: <sip:phone@browser.invalid;transport=ws>",))
         assert status.startswith("SIP/2.0 %d " % code), status
+        expect_cdr(call, [("admitted", None, None, None), ("progress", 180, None, None),
+                          ("failed", code, reason, "upstream")])
 failure_thread.join(3)
 assert not failure_thread.is_alive(), "failure carrier did not finish"
 if failures: raise failures[0]
@@ -132,27 +134,33 @@ finally:
 assert exported["schemaVersion"] == 1 and exported["tenantId"] == projected_tenant
 assert len(exported["events"]) >= 6, exported
 assert {"admitted", "answered", "ended"}.issubset({event["type"] for event in exported["events"]}), exported
+sequences = [event["sequence"] for event in exported["events"]]
+assert sequences == sorted(sequences) and len(sequences) == len(set(sequences)), sequences
 for event in exported["events"]:
     assert set(event) == {"schemaVersion", "eventId", "sequence", "callId", "tenantId", "seatId", "snapshotRevision", "type", "occurredAtMs", "startedAtMs", "sipCallId", "fromTag", "legId", "destination", "requestedCallerId", "effectiveCallerId", "sipCode", "reason", "endedBy"}
     assert "password" not in json.dumps(event).lower()
 calls = {}
 for event in exported["events"]:
-    calls.setdefault(event["callId"], []).append(event)
-assert len(calls) == 5, calls
-for events in calls.values():
-    ending = next((event for event in events if event["type"] == "ended"), None)
-    if ending:
-        assert [event["type"] for event in events] == ["admitted", "answered", "ended"], events
-        assert events[-1]["legId"] == events[1]["legId"], events
-        assert events[-1]["reason"] == "normal", events
+    calls.setdefault(event["sipCallId"], []).append(event)
+assert set(calls) == set(expected_cdr_calls), (set(calls), set(expected_cdr_calls))
+assert not (set(calls) & rejected_cdr_calls), (set(calls), rejected_cdr_calls)
+for sip_call_id, expected in expected_cdr_calls.items():
+    events = calls[sip_call_id]
+    actual = [(event["type"], event["sipCode"], event["reason"], event["endedBy"])
+              for event in events]
+    assert actual[0] == expected[0], (sip_call_id, actual, expected)
+    if any(item[0] == "progress" for item in expected):
+        # Separate SIP workers may append progress after the final failure.
+        # Still require exactly the expected events, codes and terminal reason.
+        assert sorted(actual[1:]) == sorted(expected[1:]), (sip_call_id, actual, expected)
     else:
-        # Separate SIP workers can deliver the provisional and final hook in
-        # either order. Evidence must converge without reopening the call.
-        assert sorted(event["type"] for event in events) == ["admitted", "failed", "progress"], events
-        expected = {486: "busy", 603: "rejected", 480: "no_answer"}
-        failure = next(event for event in events if event["type"] == "failed")
-        assert failure["reason"] == expected[failure["sipCode"]], events
-    assert events[0]["startedAtMs"] <= events[1]["occurredAtMs"] <= events[-1]["occurredAtMs"], events
+        assert actual == expected, (sip_call_id, actual, expected)
+    assert len({event["callId"] for event in events}) == 1, events
+    assert all(event["startedAtMs"] <= event["occurredAtMs"] for event in events), events
+    if events[-1]["type"] == "ended":
+        assert events[-1]["legId"] == events[1]["legId"], events
+        assert all(left["occurredAtMs"] <= right["occurredAtMs"]
+                   for left, right in zip(events, events[1:])), events
 with open("/tmp/call-events.json", "w", encoding="utf-8") as output:
     json.dump(exported, output)
 last = exported["nextSequence"]

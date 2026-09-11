@@ -24,6 +24,11 @@ UPSTREAM = 15060
 LOCAL_PASSWORD = "local-pass"
 failures = []
 seen = [0]
+expected_cdr_calls = {}
+rejected_cdr_calls = set()
+
+def expect_cdr(call, events):
+    expected_cdr_calls[call] = events
 
 def exact(s, n):
     out = b""
@@ -173,6 +178,7 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
     # Owner assigned policy rejects an unassigned requested number before upstream.
     call = uuid.uuid4().hex + "@phone.invalid"
     status, _ = challenged("INVITE", "sip:18005550100@" + SEAT_DOMAIN, "alice", LOCAL_PASSWORD, 8, call, extra=("X-Bitcall-Caller-ID: +12025559999",)); assert status.startswith("SIP/2.0 403 "), status
+    rejected_cdr_calls.add(call)
     # Caller-ID hints are parsed only for INVITEs, after local authentication.
     # Malformed, ambiguous, and required-but-empty hints must never reach the carrier.
     for cseq, user, password, headers in (
@@ -183,6 +189,7 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
         call = uuid.uuid4().hex + "@phone.invalid"
         status, _ = challenged("INVITE", "sip:18005550100@" + SEAT_DOMAIN, user, password, cseq, call, extra=headers)
         assert status.startswith("SIP/2.0 400 "), status
+        rejected_cdr_calls.add(call)
     time.sleep(.2); assert seen[0] == 0, seen
     # Owner and agent each complete a local REGISTER, then an INVITE through one profile.
     # Alice omits the hint to prove assigned-policy defaulting. Bob has an empty
@@ -209,6 +216,8 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
             assert KamailioRpc().active_cdr_ids(), "active dialog inventory lost its journal ID"
         send_frame(ws, dialog_request("BYE", target, user, cseq + 4, call, to, routes))
         status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+        expect_cdr(call, [("admitted", None, None, None), ("answered", 200, None, None),
+                          ("ended", None, "normal", "agent")])
     # A policy-enabled seat may use one live WSS registration only. A second
     # connection cannot use its digest credential to make an initial INVITE.
     limited_call = uuid.uuid4().hex + "@phone.invalid"
@@ -231,6 +240,7 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
         assert status.startswith("SIP/2.0 503 "), status
         status, _ = challenged_for(limited_ws, "INVITE", "sip:18005550100@" + SEAT_DOMAIN, "limited", "limited-pass", 62, rejected_call)
         assert status.startswith("SIP/2.0 403 "), status
+        rejected_cdr_calls.add(rejected_call)
     assert seen[0] == 2, seen
     limited_call = uuid.uuid4().hex + "@phone.invalid"
     uri = "sip:18005550100@" + SEAT_DOMAIN
@@ -243,9 +253,12 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
     blocked_call = uuid.uuid4().hex + "@phone.invalid"
     status, _ = challenged("INVITE", uri, "limited", "limited-pass", 74, blocked_call, extra=limited_headers)
     assert status.startswith("SIP/2.0 486 "), status
+    rejected_cdr_calls.add(blocked_call)
     assert seen[0] == 3, seen
     send_frame(ws, dialog_request("BYE", target, "limited", 72, limited_call, limited_to, limited_routes))
     status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+    expect_cdr(limited_call, [("admitted", None, None, None), ("answered", 200, None, None),
+                               ("ended", None, "normal", "agent")])
     after_bye = uuid.uuid4().hex + "@phone.invalid"
     status, after_reply = challenged("INVITE", uri, "limited", "limited-pass", 80, after_bye, extra=limited_headers)
     assert status.startswith("SIP/2.0 200 "), status
@@ -254,12 +267,17 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
     send_frame(ws, dialog_request("ACK", after_target, "limited", 81, after_bye, after_to, after_routes))
     send_frame(ws, dialog_request("BYE", after_target, "limited", 82, after_bye, after_to, after_routes))
     status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+    expect_cdr(after_bye, [("admitted", None, None, None), ("answered", 200, None, None),
+                            ("ended", None, "normal", "agent")])
     busy_call = uuid.uuid4().hex + "@phone.invalid"
     status, _ = challenged("INVITE", uri, "limited", "limited-pass", 90, busy_call, extra=limited_headers)
     assert status.startswith("SIP/2.0 486 "), status
+    expect_cdr(busy_call, [("admitted", None, None, None), ("failed", 486, "busy", "upstream")])
     repeated_auth_call = uuid.uuid4().hex + "@phone.invalid"
     status, _ = challenged("INVITE", uri, "limited", "limited-pass", 100, repeated_auth_call, extra=limited_headers)
     assert status.startswith("SIP/2.0 502 "), status
+    expect_cdr(repeated_auth_call, [("admitted", None, None, None),
+                                    ("failed", 502, "upstream_failure", "gateway")])
     final_call = uuid.uuid4().hex + "@phone.invalid"
     status, final_reply = challenged("INVITE", uri, "limited", "limited-pass", 110, final_call, extra=limited_headers)
     assert status.startswith("SIP/2.0 200 "), status
@@ -268,6 +286,8 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
     send_frame(ws, dialog_request("ACK", final_target, "limited", 111, final_call, final_to, final_routes))
     send_frame(ws, dialog_request("BYE", final_target, "limited", 112, final_call, final_to, final_routes))
     status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+    expect_cdr(final_call, [("admitted", None, None, None), ("answered", 200, None, None),
+                            ("ended", None, "normal", "agent")])
 t.join(3); assert not t.is_alive(), "carrier did not complete"
 if failures: raise failures[0]
 print("PASS local denial isolation")
@@ -290,6 +310,13 @@ def diagnostic_logs(name):
             if "ERROR" in line or "CRITICAL" in line or "kamailio-cfg: invalid" in line
             or "invalid input file" in line)
     return "\n".join(keep)
+
+
+def assert_no_dialog_assignment_errors(name):
+    output = run("docker", "logs", "--tail", "250", name, stderr=subprocess.STDOUT)
+    markers = ("pv_set_dlg_variable", "assignment failed")
+    if any(marker in output for marker in markers):
+        raise AssertionError("Kamailio dialog variable assignment failed during managed call events")
 
 
 def snapshot(caller_ids=False):
@@ -375,6 +402,8 @@ def main():
                 else:
                     scenario += AFTER_CALLS
             print(run("docker", "exec", "-i", name, "python3", "-", input=scenario, timeout=45).strip())
+            if args.call_events:
+                assert_no_dialog_assignment_errors(name)
             if args.events_output:
                 args.events_output.write_text(run("docker", "exec", name, "cat", "/tmp/call-events.json"), encoding="utf-8")
         except Exception:
