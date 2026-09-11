@@ -115,6 +115,24 @@ class SnapshotValidationTests(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             validate_snapshot(data, NOW)
 
+    def test_optional_admission_policy_is_bounded_and_generation_scoped(self):
+        self.assertNotIn("admissionPolicy", validate_snapshot(snapshot(), NOW)["seats"][0])
+        data = snapshot()
+        data["seats"][0]["admissionPolicy"] = {"maxRegisteredConnections": 2, "maxActiveCalls": 3}
+        normalized = validate_snapshot(data, NOW)
+        self.assertEqual(normalized["seats"][0]["admissionPolicy"],
+                         {"maxRegisteredConnections": 2, "maxActiveCalls": 3})
+        rendered = render_snapshot(normalized)
+        self.assertIn("admission_max_connections) = 2", rendered)
+        self.assertIn("admission_max_calls) = 3", rendered)
+        for field, value in (("maxRegisteredConnections", 0), ("maxRegisteredConnections", 6),
+                             ("maxActiveCalls", True), ("maxActiveCalls", 11)):
+            data = snapshot()
+            data["seats"][0]["admissionPolicy"] = {"maxRegisteredConnections": 1, "maxActiveCalls": 1}
+            data["seats"][0]["admissionPolicy"][field] = value
+            with self.assertRaises(SnapshotError):
+                validate_snapshot(data, NOW)
+
 
 class RenderingTests(unittest.TestCase):
     def test_secret_and_control_text_are_hex_encoded_before_config_interpolation(self):

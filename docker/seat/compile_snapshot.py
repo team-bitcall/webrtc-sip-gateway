@@ -167,7 +167,8 @@ def validate_snapshot(data, now=None):
     seats, seat_ids, usernames = [], set(), set()
     for index, item in enumerate(seats_in):
         path = "seats[%d]" % index
-        _optional_keys(item, ("id", "tenantId", "username", "profileId", "enabled", "ha1"), ("callerIdPolicy",), path)
+        _optional_keys(item, ("id", "tenantId", "username", "profileId", "enabled", "ha1"),
+                       ("callerIdPolicy", "admissionPolicy"), path)
         seat_id = _string(item["id"], path + ".id", pattern=ID_RE)
         username = _string(item["username"], path + ".username", pattern=USER_RE)
         tenant_id = _string(item["tenantId"], path + ".tenantId", pattern=ID_RE)
@@ -217,6 +218,19 @@ def validate_snapshot(data, now=None):
             if mode == "flexible" and normalized_allowed:
                 _fail(path + ".callerIdPolicy.allowedNumbers")
             seat["callerIdPolicy"] = {"mode": mode, "allowedNumbers": normalized_allowed, "defaultNumber": default}
+        if "admissionPolicy" in item:
+            policy = item["admissionPolicy"]
+            _keys(policy, ("maxRegisteredConnections", "maxActiveCalls"), path + ".admissionPolicy")
+            connections = policy["maxRegisteredConnections"]
+            calls = policy["maxActiveCalls"]
+            if type(connections) is not int or not 1 <= connections <= 5:
+                _fail(path + ".admissionPolicy.maxRegisteredConnections")
+            if type(calls) is not int or not 1 <= calls <= 10:
+                _fail(path + ".admissionPolicy.maxActiveCalls")
+            seat["admissionPolicy"] = {
+                "maxRegisteredConnections": connections,
+                "maxActiveCalls": calls,
+            }
         seats.append(seat)
     return {
         "revision": revision,
@@ -260,6 +274,12 @@ def snapshot_entries(normalized, tenant_id):
             entries.append(("seat_users", seat_prefix + "caller_id_default", policy["defaultNumber"]))
             for number in policy["allowedNumbers"]:
                 entries.append(("seat_users", seat_prefix + "caller_id_allowed::" + number, 1))
+        admission = seat.get("admissionPolicy")
+        if admission:
+            entries.append(("seat_users", seat_prefix + "admission_max_connections",
+                            admission["maxRegisteredConnections"]))
+            entries.append(("seat_users", seat_prefix + "admission_max_calls",
+                            admission["maxActiveCalls"]))
     for profile in normalized["profiles"]:
         if profile["tenantId"] != tenant_id:
             continue

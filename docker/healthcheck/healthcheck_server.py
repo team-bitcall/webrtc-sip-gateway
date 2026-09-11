@@ -5,9 +5,10 @@ import hmac
 import http.server
 import json
 import os
+import re
 import threading
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 ACME_CHALLENGE_PREFIX = "/.well-known/acme-challenge/"
 ACME_ROOT = "/var/www/acme/.well-known/acme-challenge"
@@ -90,8 +91,14 @@ class TurnCredentialsHandler(http.server.BaseHTTPRequestHandler):
             _write_plain(self, 503, "invalid TURN credential lifetime")
             return
 
+        scope = parse_qs(urlparse(self.path).query, keep_blank_values=True).get("scope")
+        if scope is not None and (len(scope) != 1 or not re.fullmatch(r"t_[a-f0-9]{64}", scope[0])):
+            _write_plain(self, 400, "invalid scope")
+            return
+        # The public proxy accepts scoped issuance only with its backend bearer.
+        # A stable member suffix keeps identity independent of token rotation.
         expires_at = int(time.time()) + TURN_TTL
-        username = f"{expires_at}:webrtc"
+        username = f"{expires_at}:{scope[0] if scope else 'webrtc'}"
         mac = hmac.new(
             TURN_SECRET.encode("utf-8"),
             username.encode("utf-8"),

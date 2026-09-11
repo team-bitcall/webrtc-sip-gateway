@@ -51,6 +51,22 @@ class TurnCredentialsTest(unittest.TestCase):
         self.assertEqual(headers["Cache-Control"], "private, no-store")
         self.assertNotIn(b"unit-test-only", body)
 
+    def test_member_scopes_are_distinct_and_hmac_bound(self):
+        usernames = []
+        for member in ("a", "b"):
+            scope = "t_" + member * 64
+            status, _, body = self.request(path="/turn-credentials?scope=" + scope)
+            self.assertEqual(status, 200)
+            payload = json.loads(body)
+            self.assertTrue(payload["username"].endswith(":" + scope))
+            expected = base64.b64encode(hmac.new(b"unit-test-only",
+                payload["username"].encode(), hashlib.sha1).digest()).decode()
+            self.assertEqual(payload["credential"], expected)
+            usernames.append(payload["username"])
+        self.assertNotEqual(*usernames)
+        for query in ("scope=", "scope=arbitrary", "scope=t_" + "a" * 64 + "&scope=t_" + "b" * 64):
+            self.assertEqual(self.request(path="/turn-credentials?" + query)[0], 400)
+
     def test_disabled_or_missing_secret_does_not_issue_credentials(self):
         for kwargs in ({"secret": ""}, {"mode": "none"}, {"path": "/other"}):
             with self.subTest(kwargs=kwargs):

@@ -161,9 +161,22 @@ def main():
                 if expected == 200:
                     data = json.loads(body)
                     assert data["expiresAt"] == int(data["username"].split(":")[0])
+                    assert data["username"].endswith(":webrtc"), data["username"]
                     assert "cache-control: private, no-store" in headers
                     assert len(data["uris"]) == 3
                     assert 3500 <= data["expiresAt"] - time.time() <= 3600
+                    scope = "t_" + "a" * 64
+                    scoped_status, scoped_headers, scoped_body = request(
+                        path="/turn-credentials?scope=" + scope)
+                    assert scoped_status == 200
+                    scoped = json.loads(scoped_body)
+                    assert scoped["username"].endswith(":" + scope), scoped["username"]
+                    assert scoped["username"].split(":", 1)[0] == str(scoped["expiresAt"])
+                    assert scoped["username"] != data["username"]
+                    assert "cache-control: private, no-store" in scoped_headers
+                    assert request(path="/turn-credentials?scope=not-a-member")[0] == 400
+                    assert request(path="/turn-credentials?scope=" + scope + "&scope=" + scope)[0] == 400
+                    assert request(path="/turn-credentials?scope=" + scope, auth=False)[0] == 401
                     pids_before = sorted(run("docker", "exec", name, "pgrep", "-x", "kamailio").split())
                     print(run("docker", "exec", name, "python3", "-c", WSS_STRESS_SCRIPT,
                               timeout=18).strip(), flush=True)
@@ -179,7 +192,7 @@ def main():
                                          r"\bSIG(?:SEGV|ABRT)\b|\bsignal\s*[:=]?\s*(?:6|11)\b",
                                          logs, re.IGNORECASE), "Crash signature in gateway logs"
                     print("PASS stable Kamailio processes, post-stress credentials, and graceful shutdown", flush=True)
-                print(f"PASS mode={mode} ttl={ttl}: status={status}; auth/method/path/origin guards", flush=True)
+                print(f"PASS mode={mode} ttl={ttl}: legacy and scoped credentials; auth/method/path/origin guards", flush=True)
             except Exception:
                 if created:
                     print(run("docker", "logs", "--tail", "80", name, stderr=subprocess.STDOUT), flush=True)

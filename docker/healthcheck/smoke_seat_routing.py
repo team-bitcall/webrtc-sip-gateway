@@ -75,9 +75,9 @@ def auth_header(method, uri, user, password, challenge, name="Authorization"):
     fields = ['username="%s"' % user, 'realm="%s"' % realm, 'nonce="%s"' % value, 'uri="%s"' % uri, 'response="%s"' % response]
     if qop: fields += ["qop=auth", "nc=" + nc, 'cnonce="%s"' % cnonce]
     return name + ": Digest " + ", ".join(fields)
-def request(method, uri, user, cseq, call_id, extra=()):
+def request(method, uri, user, cseq, call_id, extra=(), contact_host="browser.invalid"):
     to_uri = "sip:%s@%s" % (user, SEAT_DOMAIN) if method == "REGISTER" else uri
-    contact = ("Contact: <sip:%s@browser.invalid;transport=ws>;expires=600" % user,) if method == "REGISTER" else ()
+    contact = ("Contact: <sip:%s@%s;transport=ws>;expires=600" % (user, contact_host),) if method == "REGISTER" else ()
     return "\r\n".join(["%s %s SIP/2.0" % (method, uri), "Via: SIP/2.0/WSS phone.invalid;branch=z9hG4bK" + uuid.uuid4().hex + ";rport", "Max-Forwards: 16", "From: <sip:%s@%s>;tag=phone" % (user, SEAT_DOMAIN), "To: <%s>" % to_uri, "Call-ID: " + call_id, "CSeq: %d %s" % (cseq, method), *contact, *extra, "Content-Length: 0", "", ""])
 def valid_digest(header, method, uri, ha1):
     p = params(header); qop = p.get("qop")
@@ -90,18 +90,24 @@ def carrier():
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
             s.bind(("127.0.0.1", UPSTREAM)); s.settimeout(12)
-            expected_caller_ids = ["+12025550100", "+12025550199"]
-            for index in range(2):
+            expected_caller_ids = ["+12025550100", "+12025550199", "upstream-a", "upstream-a", "upstream-a", "upstream-a", "upstream-a"]
+            for index in range(7):
                 invite, peer = s.recvfrom(65535); invite = invite.decode(); line, h = parse(invite)
                 assert line.startswith("INVITE ") and expected_caller_ids[index] in h["from"][0], line
                 assert not any(key.startswith("p-k-cseq") for key in h), h
                 assert "x-bitcall-tenant" not in h, h
-                assert h.get("p-asserted-identity", [""])[0].find(expected_caller_ids[index]) >= 0, h
-                assert h.get("remote-party-id", [""])[0].find(expected_caller_ids[index]) >= 0, h
+                if index < 2:
+                    assert h.get("p-asserted-identity", [""])[0].find(expected_caller_ids[index]) >= 0, h
+                    assert h.get("remote-party-id", [""])[0].find(expected_caller_ids[index]) >= 0, h
                 assert "forged@example.test" not in "\n".join(h.get("p-asserted-identity", []) + h.get("remote-party-id", [])), h
                 assert "authorization" not in h and "proxy-authorization" not in h, h
                 initial_cseq = int(h["cseq"][0].split()[0])
                 seen[0] += 1
+                if index == 4:
+                    s.sendto(reply(invite, 486, "Busy Here"), peer)
+                    terminal, _ = s.recvfrom(65535)
+                    assert terminal.decode().startswith("ACK "), terminal[:40]
+                    continue
                 challenge_name, status_code, status_reason, auth_name, qop = (("Proxy-Authenticate", 407, "Proxy Authentication Required", "proxy-authorization", "auth") if index == 0 else ("WWW-Authenticate", 401, "Unauthorized", "authorization", None))
                 qop_field = ', qop="auth"' if qop else ""
                 s.sendto(reply(invite, status_code, status_reason, '%s: Digest realm="carrier.example.test", nonce="upstream-%d"%s' % (challenge_name, seen[0], qop_field)), peer)
@@ -114,6 +120,11 @@ def carrier():
                 header = h[auth_name][0]
                 assert ("qop=auth" in header) == bool(qop), header
                 valid_digest(header, "INVITE", status.split()[1], "6ee53e85140577a263e338faa5535881")
+                if index == 5:
+                    s.sendto(reply(authenticated, status_code, status_reason, '%s: Digest realm="carrier.example.test", nonce="again-%d"%s' % (challenge_name, seen[0], qop_field)), peer)
+                    terminal, _ = s.recvfrom(65535)
+                    assert terminal.decode().startswith("ACK "), terminal[:40]
+                    continue
                 record_routes = "".join("Record-Route: " + value + "\r\n" for value in h.get("record-route", []))
                 answer = reply(authenticated, 200, "OK").decode().replace("Content-Length: 0", "Contact: <sip:provider@127.0.0.1:15060>\r\n" + record_routes + "Content-Length: 0").encode()
                 s.sendto(answer, peer)
@@ -138,16 +149,18 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
     headers = b""
     while b"\r\n\r\n" not in headers: headers += exact(ws, 1)
     assert b" 101 " in headers.split(b"\r\n", 1)[0], headers[:100]
-    def challenged(method, uri, user, password, cseq, call, from_user=None, extra=()):
-        send_frame(ws, request(method, uri, from_user or user, cseq, call, extra))
-        status, h = parse(text(ws)); expected, challenge = ("401", "www-authenticate") if method == "REGISTER" else ("407", "proxy-authenticate")
+    def challenged_for(phone, method, uri, user, password, cseq, call, from_user=None, extra=(), contact_host="browser.invalid"):
+        send_frame(phone, request(method, uri, from_user or user, cseq, call, extra, contact_host))
+        status, h = parse(text(phone)); expected, challenge = ("401", "www-authenticate") if method == "REGISTER" else ("407", "proxy-authenticate")
         assert status.startswith("SIP/2.0 " + expected + " "), status
         name = "Authorization" if method == "REGISTER" else "Proxy-Authorization"
-        send_frame(ws, request(method, uri, from_user or user, cseq + 1, call, extra + (auth_header(method, uri, user, password, h[challenge][0], name),)))
+        send_frame(phone, request(method, uri, from_user or user, cseq + 1, call, extra + (auth_header(method, uri, user, password, h[challenge][0], name),), contact_host))
         while True:
-            result = parse(text(ws))
+            result = parse(text(phone))
             if int(result[0].split()[1]) >= 200:
                 return result
+    def challenged(method, uri, user, password, cseq, call, from_user=None, extra=()):
+        return challenged_for(ws, method, uri, user, password, cseq, call, from_user, extra)
     # Bad credentials, unknown users, revoked users, and header/user mismatch stay local.
     call = uuid.uuid4().hex + "@phone.invalid"
     status, _ = challenged("REGISTER", "sip:" + SEAT_DOMAIN, "alice", "wrong", 1, call); assert status.startswith("SIP/2.0 401 "), status
@@ -196,6 +209,65 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
             assert KamailioRpc().active_cdr_ids(), "active dialog inventory lost its journal ID"
         send_frame(ws, dialog_request("BYE", target, user, cseq + 4, call, to, routes))
         status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+    # A policy-enabled seat may use one live WSS registration only. A second
+    # connection cannot use its digest credential to make an initial INVITE.
+    limited_call = uuid.uuid4().hex + "@phone.invalid"
+    status, _ = challenged("REGISTER", "sip:" + SEAT_DOMAIN, "limited", "limited-pass", 50, limited_call)
+    assert status.startswith("SIP/2.0 200 "), status
+    with socket.create_connection(("127.0.0.1", 443), timeout=10) as limited_raw:
+      with context.wrap_socket(limited_raw, server_hostname=GATEWAY_DOMAIN) as limited_ws:
+        limited_key = base64.b64encode(os.urandom(16)).decode()
+        limited_ws.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Protocol: sip\r\nOrigin: https://%s\r\n\r\n" % (GATEWAY_DOMAIN, limited_key, GATEWAY_DOMAIN)).encode())
+        limited_headers = b""
+        while b"\r\n\r\n" not in limited_headers: limited_headers += exact(limited_ws, 1)
+        assert b" 101 " in limited_headers.split(b"\r\n", 1)[0], limited_headers[:100]
+        rejected_call = uuid.uuid4().hex + "@phone.invalid"
+        status, _ = challenged_for(limited_ws, "REGISTER", "sip:" + SEAT_DOMAIN, "limited", "limited-pass", 60, rejected_call)
+        assert status.startswith("SIP/2.0 503 "), status
+        # Replaying the client-controlled Call-ID/CSeq with a distinct Contact
+        # must not erase the primary connection from the policy count.
+        status, _ = challenged_for(limited_ws, "REGISTER", "sip:" + SEAT_DOMAIN, "limited", "limited-pass", 60,
+                                  rejected_call, contact_host="attacker.invalid")
+        assert status.startswith("SIP/2.0 503 "), status
+        status, _ = challenged_for(limited_ws, "INVITE", "sip:18005550100@" + SEAT_DOMAIN, "limited", "limited-pass", 62, rejected_call)
+        assert status.startswith("SIP/2.0 403 "), status
+    assert seen[0] == 2, seen
+    limited_call = uuid.uuid4().hex + "@phone.invalid"
+    uri = "sip:18005550100@" + SEAT_DOMAIN
+    limited_headers = ("Contact: <sip:limited@browser.invalid;transport=ws>",)
+    status, limited_reply = challenged("INVITE", uri, "limited", "limited-pass", 70, limited_call, extra=limited_headers)
+    assert status.startswith("SIP/2.0 200 "), status
+    target, limited_to = limited_reply["contact"][0].split("<", 1)[1].split(">", 1)[0], limited_reply["to"][0]
+    limited_routes = list(reversed(limited_reply["record-route"]))
+    send_frame(ws, dialog_request("ACK", target, "limited", 71, limited_call, limited_to, limited_routes))
+    blocked_call = uuid.uuid4().hex + "@phone.invalid"
+    status, _ = challenged("INVITE", uri, "limited", "limited-pass", 74, blocked_call, extra=limited_headers)
+    assert status.startswith("SIP/2.0 486 "), status
+    assert seen[0] == 3, seen
+    send_frame(ws, dialog_request("BYE", target, "limited", 72, limited_call, limited_to, limited_routes))
+    status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+    after_bye = uuid.uuid4().hex + "@phone.invalid"
+    status, after_reply = challenged("INVITE", uri, "limited", "limited-pass", 80, after_bye, extra=limited_headers)
+    assert status.startswith("SIP/2.0 200 "), status
+    after_target, after_to = after_reply["contact"][0].split("<", 1)[1].split(">", 1)[0], after_reply["to"][0]
+    after_routes = list(reversed(after_reply["record-route"]))
+    send_frame(ws, dialog_request("ACK", after_target, "limited", 81, after_bye, after_to, after_routes))
+    send_frame(ws, dialog_request("BYE", after_target, "limited", 82, after_bye, after_to, after_routes))
+    status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+    busy_call = uuid.uuid4().hex + "@phone.invalid"
+    status, _ = challenged("INVITE", uri, "limited", "limited-pass", 90, busy_call, extra=limited_headers)
+    assert status.startswith("SIP/2.0 486 "), status
+    repeated_auth_call = uuid.uuid4().hex + "@phone.invalid"
+    status, _ = challenged("INVITE", uri, "limited", "limited-pass", 100, repeated_auth_call, extra=limited_headers)
+    assert status.startswith("SIP/2.0 502 "), status
+    final_call = uuid.uuid4().hex + "@phone.invalid"
+    status, final_reply = challenged("INVITE", uri, "limited", "limited-pass", 110, final_call, extra=limited_headers)
+    assert status.startswith("SIP/2.0 200 "), status
+    final_target, final_to = final_reply["contact"][0].split("<", 1)[1].split(">", 1)[0], final_reply["to"][0]
+    final_routes = list(reversed(final_reply["record-route"]))
+    send_frame(ws, dialog_request("ACK", final_target, "limited", 111, final_call, final_to, final_routes))
+    send_frame(ws, dialog_request("BYE", final_target, "limited", 112, final_call, final_to, final_routes))
+    status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
 t.join(3); assert not t.is_alive(), "carrier did not complete"
 if failures: raise failures[0]
 print("PASS local denial isolation")
@@ -203,6 +275,8 @@ print("PASS owner password-profile upstream digest")
 print("PASS agent HA1-profile upstream digest")
 print("PASS CSeq and identity-header isolation")
 print("PASS caller-ID policy validation and default/flexible selection")
+print("PASS policy registration connection and active-call admission limits")
+print("PASS policy slots release after busy and repeated upstream authentication failure")
 '''
 
 
@@ -223,7 +297,7 @@ def snapshot(caller_ids=False):
     data = {"schemaVersion": 1, "revision": 1, "issuedAt": int(time.time()), "validUntil": int(time.time()) + 240,
             "domain": "seats.example.test",
             "profiles": [{"id": "profile-a", "tenantId": "tenant-a", "enabled": True, "username": "upstream-a", "realm": "carrier.example.test", "requestDomain": "carrier.example.test", "outboundProxy": "sip:127.0.0.1:15060;transport=udp", "credential": {"kind": "password", "value": "carrier-pass"}, "fromUser": "upstream-a"}, {"id": "profile-b", "tenantId": "tenant-a", "enabled": True, "username": "upstream-a", "realm": "carrier.example.test", "requestDomain": "carrier.example.test", "outboundProxy": "sip:127.0.0.1:15060;transport=udp", "credential": {"kind": "ha1", "value": "6ee53e85140577a263e338faa5535881"}, "fromUser": "upstream-a"}],
-            "seats": [{"id": "alice-seat", "tenantId": "tenant-a", "username": "alice", "profileId": "profile-a", "enabled": True, "ha1": ha1, "callerIdPolicy": {"mode": "assigned", "allowedNumbers": ["+12025550100", "+12025550101"], "defaultNumber": "+12025550100"}}, {"id": "bob-seat", "tenantId": "tenant-a", "username": "bob", "profileId": "profile-b", "enabled": True, "ha1": __import__("hashlib").md5(b"bob:seats.example.test:other-pass").hexdigest(), "callerIdPolicy": {"mode": "flexible", "allowedNumbers": [], "defaultNumber": ""}}, {"id": "revoked-seat", "tenantId": "tenant-a", "username": "revoked", "profileId": "profile-a", "enabled": False, "ha1": ha1}]}
+            "seats": [{"id": "alice-seat", "tenantId": "tenant-a", "username": "alice", "profileId": "profile-a", "enabled": True, "ha1": ha1, "callerIdPolicy": {"mode": "assigned", "allowedNumbers": ["+12025550100", "+12025550101"], "defaultNumber": "+12025550100"}}, {"id": "bob-seat", "tenantId": "tenant-a", "username": "bob", "profileId": "profile-b", "enabled": True, "ha1": __import__("hashlib").md5(b"bob:seats.example.test:other-pass").hexdigest(), "callerIdPolicy": {"mode": "flexible", "allowedNumbers": [], "defaultNumber": ""}}, {"id": "limited-seat", "tenantId": "tenant-a", "username": "limited", "profileId": "profile-a", "enabled": True, "ha1": __import__("hashlib").md5(b"limited:seats.example.test:limited-pass").hexdigest(), "admissionPolicy": {"maxRegisteredConnections": 1, "maxActiveCalls": 1}}, {"id": "revoked-seat", "tenantId": "tenant-a", "username": "revoked", "profileId": "profile-a", "enabled": False, "ha1": ha1}]}
     if not caller_ids:
         for seat in data["seats"]:
             seat.pop("callerIdPolicy", None)
