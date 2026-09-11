@@ -15,8 +15,11 @@ import uuid
 import av
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, "/seat-proof")
 from media_fixture import NgClient, PcmuPeer, parse_rtp, pcmu_decode_many, tone, tone_energies, write_wav
 from media_webrtc_peer import WebRtcPeer
+from call_journal import CallJournal
+from media_control import MediaController, MediaError
 
 def engine_resources():
     status = Path('/proc/1/status').read_text()
@@ -158,7 +161,24 @@ async def main():
     provider_source = tone([660], samples=8000)
     browser = WebRtcPeer(outgoing=True, max_samples=64000)
     listener = WebRtcPeer(max_samples=64000)
+    expiry_listener = None
     with NgClient() as ng, PcmuPeer(ssrc=0xB002) as provider, PcmuPeer(ssrc=0xCC03) as distractor, PcmuPeer(ssrc=0xDD04) as other_end:
+        state = Path('/tmp/seat-state')
+        state.mkdir(mode=0o700)
+        state.chmod(0o700)
+        media_clock = [int(time.time() * 1000)]
+
+        class FixtureRpc:
+            """Fixture boundary only: production controller still validates journal and NG state."""
+            def __init__(self): self.active = set()
+            def active_cdr_ids(self): return set(self.active)
+
+        rpc = FixtureRpc()
+        journal = CallJournal(state, clock=lambda: media_clock[0])
+        controller = MediaController(state, journal, rpc, clock=lambda: media_clock[0],
+                                     projection=lambda _tenant: {"status": "applied", "validUntil": int(time.time()) + 60})
+        tenant, seat = "t_" + "a" * 64, "s_" + "b" * 64
+        actor, listener_id = "c" * 32, "d" * 32
         try:
             for _ in range(30):
                 try:
@@ -186,15 +206,27 @@ async def main():
                 source_transports[(stream['endpoint']['address'], stream['endpoint']['port'], stream['local port'])] = tag
             assert len(source_transports) == 2
             report['sourceTransports'] = [{'tag': tag, 'sourceAddress': transport[0], 'sourcePort': transport[1], 'relayPort': transport[2]} for transport, tag in source_transports.items()]
-            unknown = ng.request({'command': 'subscribe request', 'call-id': 'nonexistent', 'from-tags': ['agent'], 'to-tag': 'listener'}, allow_error=True)
-            assert unknown.get('result') == 'error', unknown
+            _context, cdr_id = journal.admit({'tenantId': tenant, 'seatId': seat, 'snapshotRevision': 1,
+                                               'sipCallId': call, 'fromTag': 'agent', 'legId': '',
+                                               'destination': '+12025550100', 'requestedCallerId': None,
+                                               'effectiveCallerId': '+12025550101'})
+            journal.append({'callId': cdr_id, 'type': 'answered', 'legId': 'provider', 'sipCode': 200,
+                            'reason': None, 'endedBy': None})
+            rpc.active.add(cdr_id)
+            start = {'action': 'start', 'callId': cdr_id, 'listenerId': listener_id,
+                     'actorId': actor, 'leaseSeconds': 15}
+            try:
+                controller.handle("t_" + "e" * 64, start)
+            except MediaError as error:
+                assert error.code == 'MEDIA_UNAVAILABLE'
+            else:
+                raise AssertionError('foreign tenant media start succeeded')
             subscribe_started = time.monotonic()
-            requested = ng.request({'command': 'subscribe request', 'call-id': call, 'from-tags': ['agent', 'provider'], 'to-tag': 'listener', 'flags': ['WebRTC']})
-            assert requested['sdp'].count('m=audio ') == 2, 'Expected independent audio streams for both call legs'
-            assert requested['sdp'].count('a=sendonly') == 2 and 'a=sendrecv' not in requested['sdp']
-            listener_tag = requested.get('to-tag', 'listener')
-            answer = await listener.answer_subscription(requested['sdp'])
-            ng.request({'command': 'subscribe answer', 'call-id': call, 'to-tag': listener_tag, 'sdp': answer})
+            requested = controller.handle(tenant, start)
+            answer = await listener.answer_subscription(requested['offerSdp'])
+            identity = {key: value for key, value in start.items() if key != 'leaseSeconds'}
+            active_listener = controller.handle(tenant, {**identity, 'action': 'answer', 'fence': requested['fence'], 'sdp': answer})
+            assert active_listener['state'] == 'listening'
             await wait_for(lambda: listener.connectionState == 'connected' and listener.audio_ready(track_count=2), 'both listen-only tracks')
             report['subscribeReadyMs'] = round((time.monotonic() - subscribe_started) * 1000, 1)
             await asyncio.sleep(.3)
@@ -226,12 +258,32 @@ async def main():
             # Inspect actual RTPengine stream counters plus decoded content below, not browser mute.
             report['listener'] = listener.metrics
             report['checks'].append('malicious-listener-srtp-sent-source-stays-active')
-            ng.request({'command': 'unsubscribe', 'call-id': call, 'to-tag': listener_tag})
+            stopped = controller.handle(tenant, {**identity, 'action': 'stop', 'fence': active_listener['fence']})
+            assert stopped['state'] == 'ended'
+            try:
+                controller.handle(tenant, {**start, 'action': 'renew', 'fence': active_listener['fence'], 'leaseSeconds': 15})
+            except MediaError:
+                pass
+            else:
+                raise AssertionError('renew after stop succeeded')
             # The NG contract stops forwarding but retains the participant until
             # call teardown. Verify media stops, not an undocumented tag deletion.
             await wait_for_listener_stop(listener, browser, captured)
+            listener_tag = controller._listener_tag(cdr_id, actor)
             report['listenerRetainedAfterUnsubscribe'] = listener_tag in ng.request({'command': 'query', 'call-id': call})['tags']
+            assert report['listenerRetainedAfterUnsubscribe']
             await listener.close()
+            expiry_listener = WebRtcPeer(max_samples=64000)
+            expiry_start = {**start, 'listenerId': 'e' * 32, 'actorId': 'f' * 32}
+            expiry_offer = controller.handle(tenant, expiry_start)
+            expiry_answer = await expiry_listener.answer_subscription(expiry_offer['offerSdp'])
+            controller.handle(tenant, {**{key: value for key, value in expiry_start.items() if key != 'leaseSeconds'}, 'action': 'answer', 'fence': expiry_offer['fence'], 'sdp': expiry_answer})
+            await wait_for(lambda: expiry_listener.connectionState == 'connected' and expiry_listener.audio_ready(track_count=2), 'expiry listener tracks')
+            media_clock[0] += 15_001
+            controller.sweep()
+            await wait_for_listener_stop(expiry_listener, browser, captured)
+            report['checks'].append('controller-tenant-journal-ng-lease-stop-and-expiry')
+            await expiry_listener.close()
             before = len(captured)
             ng.request({'command': 'stop recording', 'call-id': call})
             await asyncio.sleep(.5)
@@ -250,6 +302,8 @@ async def main():
             for task in tasks: task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             await browser.close(); await listener.close()
+            if expiry_listener: await expiry_listener.close()
+            controller.close(); journal.close()
             for current in (call, other):
                 ng.request({'command': 'delete', 'call-id': current, 'delete-delay': 0}, allow_error=True)
                 assert ng.request({'command': 'query', 'call-id': current}, allow_error=True).get('result') == 'error', 'Call cleanup incomplete'
@@ -297,4 +351,4 @@ async def main():
 
 
 if __name__ == '__main__':
-    asyncio.run(asyncio.wait_for(main(), timeout=45))
+    asyncio.run(asyncio.wait_for(main(), timeout=52))

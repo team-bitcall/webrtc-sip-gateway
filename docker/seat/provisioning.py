@@ -21,6 +21,7 @@ import uuid
 from call_journal import CallJournal, JournalError
 from compile_snapshot import (ID_RE, MAX_BYTES, SnapshotError, USER_RE, _atomic_write, _dns,
                               _no_duplicate_keys, snapshot_entries, validate_snapshot)
+from media_control import MediaController, MediaError
 
 
 class ControlError(Exception):
@@ -463,6 +464,25 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/call-events/health" and self.command == "GET":
             if self.server.journal is None: raise ControlError(404, "NOT_FOUND")
             return self.server.journal.health()
+        match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/media", path)
+        if match:
+            if self.server.media is None: raise ControlError(404, "NOT_FOUND")
+            if self.command != "POST" or query:
+                raise ControlError(405, "METHOD_NOT_ALLOWED")
+            lengths = self.headers.get_all("Content-Length", [])
+            if self.headers.get("Transfer-Encoding") is not None or self.headers.get_content_type() != "application/json" \
+                    or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,5}", lengths[0]):
+                raise ControlError(400, "INVALID_MEDIA_REQUEST")
+            try:
+                length = int(lengths[0])
+                if not 2 <= length <= 49152:
+                    raise ValueError("invalid media length")
+                body = json.loads(self.rfile.read(length).decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+                return self.server.media.handle(match.group(1), body)
+            except MediaError as error:
+                raise ControlError(error.status, error.code) from error
+            except (ValueError, UnicodeError, RecursionError) as error:
+                raise ControlError(400, "INVALID_MEDIA_REQUEST") from error
         match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/presence", path)
         if match:
             if self.command != "GET":
@@ -609,8 +629,19 @@ def main():
                                   os.environ.get("SEAT_DOMAIN", ""), KamailioRpc())
     events_enabled = os.environ.get("SEAT_CALL_EVENTS") == "1"
     journal = CallJournal(directory) if events_enabled else None
+    media_enabled = os.environ.get("SEAT_MEDIA_ENABLED") == "1"
+    if media_enabled and journal is None:
+        raise ControlError(503, "MEDIA_UNAVAILABLE")
+    media = None
+    if media_enabled:
+        maximum = int(os.environ.get("SEAT_MEDIA_MAX_LISTENERS", "1"))
+        maximum_tenant = int(os.environ.get("SEAT_MEDIA_MAX_TENANT_SESSIONS", "100"))
+        maximum_total = int(os.environ.get("SEAT_MEDIA_MAX_TOTAL_SESSIONS", "1000"))
+        media = MediaController(directory, journal, store.rpc, maximum=maximum,
+                                maximum_tenant=maximum_tenant, maximum_total=maximum_total,
+                                projection=store.status)
     server = http.server.HTTPServer((host, int(os.environ.get("SEAT_CONTROL_PORT", "8881"))), ControlHandler)
-    server.store, server.journal, server.token = store, journal, token
+    server.store, server.journal, server.media, server.token = store, journal, media, token
     server.control_boot_id = str(uuid.uuid4())
     if tls_cert and tls_key:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -623,13 +654,21 @@ def main():
         while not stopped.is_set():
             try:
                 store.reconcile()
-                if journal:
+            except (ControlError, sqlite3.Error):
+                pass
+            if journal:
+                try:
                     # Never infer a terminal event from helper restart or RPC
                     # failure. Only a complete private dialog inventory is used.
                     journal.reconcile_active(store.rpc.active_cdr_ids())
                     journal.compact()
-            except (ControlError, JournalError, sqlite3.Error):
-                pass  # Leases expire in the SIP path even if this helper is down.
+                except (ControlError, JournalError, sqlite3.Error):
+                    pass
+            if media:
+                try:
+                    media.sweep()
+                except (MediaError, sqlite3.Error):
+                    pass
             stopped.wait(2)
 
     worker = threading.Thread(target=reconcile, daemon=True)
@@ -650,6 +689,7 @@ def main():
         server.server_close()
         store.close()
         if journal: journal.close()
+        if media: media.close()
     return 0
 
 

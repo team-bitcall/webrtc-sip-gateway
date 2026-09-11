@@ -18,12 +18,14 @@ def main():
     if args.artifacts:
         args.artifacts.mkdir(parents=True, exist_ok=False)
     source = Path(__file__).resolve().parent
+    seat_source = source.parent / 'seat'
     name = 'bitcall-media-proof-' + uuid.uuid4().hex[:12]
     created = False
     try:
         subprocess.run(['docker', 'run', '-d', '--name', name, '--network', 'none', '--read-only',
             '--tmpfs', '/tmp:rw,size=128m', '--cpus', '2', '--memory', '768m', '--pids-limit', '128',
             '--security-opt', 'no-new-privileges:true', '-e', 'BITCALL_MEDIA_LOOPBACK_FIXTURE=1', '--mount', f'type=bind,src={source},dst=/proof,readonly',
+            '--mount', f'type=bind,src={seat_source},dst=/seat-proof,readonly',
             '--entrypoint', '/bin/sh', args.image, '-ec',
             'mkdir -p /tmp/recording /tmp/artifacts; exec /usr/bin/rtpengine --config-file=none '
             '--foreground --log-stderr --table=-1 --interface=127.0.0.1 --listen-ng=127.0.0.1:2223 '
