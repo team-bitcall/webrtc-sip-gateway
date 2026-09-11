@@ -18,6 +18,9 @@ jobs:
       - name: TURN credential contract
         run: python3 -m unittest discover -s docker/healthcheck -p 'test_*.py'
 
+      - name: Protected seat snapshot contract
+        run: python3 -m unittest discover -s docker/seat -p 'test_*.py'
+
   cli:
     runs-on: ubuntu-latest
     defaults:
@@ -63,6 +66,9 @@ jobs:
 
       - name: Kamailio UAC plaintext and HA1 authentication
         run: python3 docker/healthcheck/smoke_uac_auth.py --image webrtc-sip-gateway:ci
+
+      - name: Local seats and shared upstream authenticated calls
+        run: python3 docker/healthcheck/smoke_seat_routing.py --image webrtc-sip-gateway:ci
 
       - name: Browser DTLS role stays passive from offer through answer
         run: python3 docker/healthcheck/smoke_dtls_role.py --image webrtc-sip-gateway:ci

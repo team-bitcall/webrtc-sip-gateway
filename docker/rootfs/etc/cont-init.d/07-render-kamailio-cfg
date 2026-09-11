@@ -33,4 +33,18 @@ patch_substdef "INTERNAL_WSS_PORT" "${INTERNAL_WSS_PORT:-8443}"
 
 sed -i 's|/etc/kamailio/tls.cfg|/run/kamailio/tls.cfg|' "$CFG"
 
+case "${SEAT_MODE:-disabled}" in
+  disabled) ;;
+  local)
+    # Compilation is local and private. No backend or network dependency.
+    umask 077
+    : "${SEAT_DOMAIN:?SEAT_DOMAIN is required for local mode}"
+    python3 /opt/bitcall/compile_seat_snapshot.py \
+      --input "${SEAT_SNAPSHOT_FILE:-/etc/bitcall/seats.json}" \
+      --output /run/kamailio/seat-snapshot.cfg --expected-domain "$SEAT_DOMAIN"
+    sed -i '1a #!define WITH_SEAT_MODE' "$CFG"
+    ;;
+  *) echo 'kamailio-cfg: invalid SEAT_MODE' >&2; exit 1 ;;
+esac
+
 echo "kamailio-cfg: rendered with DOMAIN=${DOMAIN:-localhost}"

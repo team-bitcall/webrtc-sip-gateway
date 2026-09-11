@@ -2,6 +2,10 @@
 
 Branch: `FEAT/webphone-expansion`, based on the installed 0.3.12 revision `73506e4d81ef704e029283c70d292f6bede262a1`. Use the team's `FEAT/…` branch convention.
 
+Current work: [task 08 local seat routing](seat-routing.md), with a separate
+disabled-by-default domain, protected startup snapshots and prepared SIP wire
+tests. Automatic provisioning remains task 09. No release version changes.
+
 Use an isolated development gateway. Deployment-specific addresses, secrets, overlays, and operational runbooks are maintained separately from this public repository. A Git branch switch does not deploy source changes into the pinned container.
 
 Prepare and test changes locally before pushing this feature branch; several commits can be included in one push. Keep normal CI, image builds, package dry runs, and tag-triggered publishing workflows enabled. A branch push runs CI but does not itself publish packages or deploy the gateway. Version bumps and release tags belong to an agreed release, which can collect multiple tested commits. No release is required for this development milestone.

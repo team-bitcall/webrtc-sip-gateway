@@ -45,6 +45,8 @@ RUN set -eux; \
     | tar -C / -Jxpf -
 
 COPY kamailio/kamailio.cfg /etc/kamailio/kamailio.cfg
+COPY kamailio/seat-routing.cfg /etc/kamailio/seat-routing.cfg
+COPY seat/compile_snapshot.py /opt/bitcall/compile_seat_snapshot.py
 COPY kamailio/tls.cfg /etc/kamailio/tls.cfg
 COPY healthcheck/healthcheck_server.py /opt/bitcall/healthcheck_server.py
 COPY rootfs/ /
