@@ -19,7 +19,7 @@ import urllib.parse
 import uuid
 
 from call_journal import CallJournal, JournalError
-from compile_snapshot import (ID_RE, MAX_BYTES, SnapshotError, _atomic_write, _dns,
+from compile_snapshot import (ID_RE, MAX_BYTES, SnapshotError, USER_RE, _atomic_write, _dns,
                               _no_duplicate_keys, snapshot_entries, validate_snapshot)
 
 
@@ -139,6 +139,119 @@ class KamailioRpc:
                     raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
                 ids.add(value)
         return ids
+
+    @staticmethod
+    def _tcp_connection_ids(value):
+        if not isinstance(value, list):
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        ids = set()
+        for connection in value:
+            if not isinstance(connection, dict) or type(connection.get("id")) is not int \
+                    or connection["id"] <= 0 or not isinstance(connection.get("type"), str) \
+                    or not isinstance(connection.get("state"), str):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            if connection["type"] in ("WS", "WSS") and connection["state"] in ("CONN_OK", "CONN_ACCEPT"):
+                ids.add(connection["id"])
+        return ids
+
+    @staticmethod
+    def _seat_contacts(value, domain, usernames, live_connection_ids):
+        """Return only countable WSS connection IDs; discard raw registrar data."""
+        if not isinstance(value, dict) or set(value) != {"Domains"} \
+                or not isinstance(value["Domains"], list):
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        counts = {seat_id: set() for seat_id in usernames.values()}
+        expected_aors = {username: {username, username + "@" + domain}
+                         for username in usernames}
+        for wrapper in value["Domains"]:
+            item = wrapper.get("Domain") if isinstance(wrapper, dict) and set(wrapper) == {"Domain"} else None
+            if not isinstance(item, dict) or not isinstance(item.get("Domain"), str) \
+                    or not isinstance(item.get("AoRs"), list):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            if item["Domain"] != "seat_location":
+                continue
+            for aor_entry in item["AoRs"]:
+                info = aor_entry.get("Info") if isinstance(aor_entry, dict) else None
+                if not isinstance(info, dict) or not isinstance(info.get("AoR"), str) \
+                        or not isinstance(info.get("Contacts"), list):
+                    raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+                username = next((name for name, aors in expected_aors.items()
+                                 if info["AoR"] in aors), None)
+                for contact_entry in info["Contacts"]:
+                    contact = contact_entry.get("Contact") if isinstance(contact_entry, dict) else None
+                    if not isinstance(contact, dict):
+                        raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+                    if username is None:
+                        continue
+                    connection_id, expires, address = (contact.get("Tcpconn-Id"),
+                                                       contact.get("Expires"), contact.get("Address"))
+                    if type(connection_id) is not int or not isinstance(address, str) \
+                            or not (type(expires) is int or expires in ("permanent", "expired", "deleted")):
+                        raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+                    if (expires == "permanent" or type(expires) is int and expires > 0) \
+                            and connection_id in live_connection_ids \
+                            and re.search(r";transport=ws(?:[;>]|$)", address, re.I):
+                        counts[usernames[username]].add(connection_id)
+        return [{"seatId": seat_id, "connections": len(counts[seat_id])}
+                for seat_id in sorted(counts)]
+
+    @staticmethod
+    def _seat_dialogs(value, tenant):
+        if not isinstance(value, list):
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        dialogs = []
+        for dialog in value:
+            if not isinstance(dialog, dict) or type(dialog.get("state")) is not int \
+                    or dialog["state"] not in (1, 2, 3, 4, 5):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            if dialog["state"] == 5:
+                continue
+            if not isinstance(dialog.get("variables"), list):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            variables = {}
+            for variable in dialog["variables"]:
+                if not isinstance(variable, dict) or len(variable) != 1:
+                    raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+                key, item = next(iter(variable.items()))
+                if key in ("seat_tenant", "seat_id", "seat_cdr_id"):
+                    if key in variables:
+                        raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+                    variables[key] = item
+            if "seat_tenant" in variables and not isinstance(variables["seat_tenant"], str):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            if variables.get("seat_tenant") != tenant:
+                continue
+            call_id, seat_id = variables.get("seat_cdr_id"), variables.get("seat_id")
+            if not isinstance(call_id, str) or not re.fullmatch(r"[0-9a-f]{32}", call_id) \
+                    or not isinstance(seat_id, str) or not ID_RE.fullmatch(seat_id):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            dialogs.append({"callId": call_id, "seatId": seat_id,
+                            "state": "confirmed" if dialog["state"] >= 3 else "early"})
+        unique = {}
+        for dialog in dialogs:
+            previous = unique.get(dialog["callId"])
+            if previous is not None and previous["seatId"] != dialog["seatId"]:
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            if previous is None or dialog["state"] == "confirmed":
+                unique[dialog["callId"]] = dialog
+        if len(unique) > 1000:
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        return sorted(unique.values(), key=lambda item: item["callId"])
+
+    def presence(self, tenant, domain, usernames):
+        if not isinstance(usernames, dict) or len(usernames) > 100 \
+                or any(not USER_RE.fullmatch(user) or not ID_RE.fullmatch(seat)
+                       for user, seat in usernames.items()):
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        contacts = self.call("ul.dump", inventory=True)
+        connections = self.call("core.tcp_list", inventory=True)
+        dialogs = self.call("dlg.list_ctx", inventory=True)
+        registrations = self._seat_contacts(contacts, domain, usernames,
+                                             self._tcp_connection_ids(connections))
+        if sum(item["connections"] for item in registrations) > 1000:
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        return {"registrations": registrations,
+                "dialogs": self._seat_dialogs(dialogs, tenant)}
 
 
 class TenantProjectionStore:
@@ -260,6 +373,53 @@ class TenantProjectionStore:
                 "applied" if self._active(row) else "pending")
             return self._public(row, status)
 
+    @staticmethod
+    def _presence_rows(value):
+        if not isinstance(value, dict) or set(value) != {"registrations", "dialogs"} \
+                or not isinstance(value["registrations"], list) or not isinstance(value["dialogs"], list) \
+                or len(value["registrations"]) > 100 or len(value["dialogs"]) > 1000:
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        registrations, dialogs = value["registrations"], value["dialogs"]
+        if any(not isinstance(row, dict) or set(row) != {"seatId", "connections"}
+               or not isinstance(row["seatId"], str) or not re.fullmatch(r"s_[0-9a-f]{64}", row["seatId"])
+               or type(row["connections"]) is not int or not 0 <= row["connections"] <= 1000
+               for row in registrations) or len({row["seatId"] for row in registrations}) != len(registrations):
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        if any(not isinstance(row, dict) or set(row) != {"callId", "seatId", "state"}
+               or not isinstance(row["callId"], str) or not re.fullmatch(r"[0-9a-f]{32}", row["callId"])
+               or not isinstance(row["seatId"], str) or not re.fullmatch(r"s_[0-9a-f]{64}", row["seatId"])
+               or row["state"] not in ("early", "confirmed") for row in dialogs) \
+                or len({row["callId"] for row in dialogs}) != len(dialogs):
+            raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+        return registrations, dialogs
+
+    def presence(self, tenant, control_boot_id):
+        with self.lock:
+            row = self._row(tenant)
+            if not row:
+                raise ControlError(404, "TENANT_NOT_PROVISIONED")
+            status = "expired" if row["valid_until"] <= int(self.clock()) else (
+                "applied" if self._active(row) else "pending")
+            try:
+                payload = json.loads(row["payload"])
+                seats = payload["seats"]
+                usernames = {seat["username"]: seat["id"] for seat in seats}
+            except (KeyError, TypeError, ValueError) as error:
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE") from error
+            if not isinstance(seats, list) or len(seats) > 100 or len(usernames) != len(seats):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            registrations, dialogs = self._presence_rows(self.rpc.presence(tenant, self.domain, usernames))
+            observed_at = int(self.clock() * 1000)
+            if type(row["revision"]) is not int or row["revision"] < 1 or observed_at < 1 \
+                    or not isinstance(control_boot_id, str) or not re.fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", control_boot_id):
+                raise ControlError(503, "GATEWAY_STATE_UNAVAILABLE")
+            return {"schemaVersion": 1, "tenantId": tenant,
+                    "observedAtMs": observed_at,
+                    "controlBootId": control_boot_id, "policyRevision": row["revision"],
+                    "projectionStatus": status, "registrations": registrations,
+                    "dialogs": dialogs}
+
     def reconcile(self):
         with self.lock:
             rows = self.db.execute("SELECT * FROM tenants WHERE valid_until>?", (int(self.clock()),)).fetchall()
@@ -303,6 +463,13 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/call-events/health" and self.command == "GET":
             if self.server.journal is None: raise ControlError(404, "NOT_FOUND")
             return self.server.journal.health()
+        match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/presence", path)
+        if match:
+            if self.command != "GET":
+                raise ControlError(405, "METHOD_NOT_ALLOWED")
+            if query:
+                raise ControlError(400, "INVALID_PRESENCE")
+            return self.server.store.presence(match.group(1), self.server.control_boot_id)
         match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/call-events", path)
         if match and self.command == "GET":
             if self.server.journal is None: raise ControlError(404, "NOT_FOUND")
@@ -444,6 +611,7 @@ def main():
     journal = CallJournal(directory) if events_enabled else None
     server = http.server.HTTPServer((host, int(os.environ.get("SEAT_CONTROL_PORT", "8881"))), ControlHandler)
     server.store, server.journal, server.token = store, journal, token
+    server.control_boot_id = str(uuid.uuid4())
     if tls_cert and tls_key:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = ssl.TLSVersion.TLSv1_2

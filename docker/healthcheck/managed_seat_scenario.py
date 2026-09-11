@@ -5,9 +5,10 @@ isolated network-less container. All credentials here are synthetic fixtures.
 """
 
 BEFORE_CALLS = r'''
-import copy, hashlib, http.client, json, time
+import copy, hashlib, http.client, json, os, sys, time
 
 control_token = "a" * 43
+presence_latencies_ms = []
 with open("/tmp/seat-snapshot.json", encoding="utf-8") as source:
     original_projection = json.load(source)
 
@@ -22,6 +23,60 @@ def control(method, data=None, token=control_token, origin=None):
         return response.status, json.loads(response.read())
     finally:
         connection.close()
+
+def presence(token=control_token, origin=None, suffix=""):
+    connection = http.client.HTTPConnection("127.0.0.1", 8881, timeout=5)
+    headers = {"Authorization": "Bearer " + token}
+    if origin is not None: headers["Origin"] = origin
+    try:
+        tenant = original_projection["seats"][0]["tenantId"]
+        connection.request("GET", "/v1/tenants/" + tenant + "/presence" + suffix, headers=headers)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+    finally:
+        connection.close()
+
+def presence_failure_diagnostics():
+    """Synthetic-fixture-only shape evidence for a failed private observation."""
+    sys.path.insert(0, "/opt/bitcall/seat")
+    from provisioning import ControlError, KamailioRpc
+    rpc = KamailioRpc()
+    values = {}
+    for name, method in (("usrloc", "ul.dump"), ("tcp", "core.tcp_list"), ("dialog", "dlg.list_ctx")):
+        try:
+            values[name] = rpc.call(method, inventory=True)
+        except ControlError as error:
+            print("PRESENCE_DIAG %s rpc=%s" % (name, error.code), file=sys.stderr)
+    def redact(value):
+        if isinstance(value, dict):
+            return {key: ("<redacted>" if "auth" in key.lower() or "password" in key.lower() else redact(item))
+                    for key, item in value.items()}
+        if isinstance(value, list): return [redact(item) for item in value]
+        return value
+    for name, value in values.items():
+        print("PRESENCE_DIAG %s raw=%s" % (name, repr(redact(value))[:4000]), file=sys.stderr)
+    try:
+        usernames = {seat["username"]: seat["id"] for seat in original_projection["seats"]}
+        live = rpc._tcp_connection_ids(values["tcp"])
+        rpc._seat_contacts(values["usrloc"], os.environ["SEAT_DOMAIN"], usernames, live)
+        rpc._seat_dialogs(values["dialog"], original_projection["seats"][0]["tenantId"])
+        print("PRESENCE_DIAG parsers=ok", file=sys.stderr)
+    except (ControlError, KeyError) as error:
+        print("PRESENCE_DIAG parsers=%s" % getattr(error, "code", "missing-rpc"), file=sys.stderr)
+
+def checked_presence():
+    started = time.perf_counter()
+    status, observed = presence()
+    presence_latencies_ms.append((time.perf_counter() - started) * 1000)
+    if status != 200: presence_failure_diagnostics()
+    assert status == 200, status
+    assert set(observed) == {"schemaVersion", "tenantId", "observedAtMs", "controlBootId",
+                             "policyRevision", "projectionStatus", "registrations", "dialogs"}
+    assert observed["schemaVersion"] == 1 and observed["tenantId"] == original_projection["seats"][0]["tenantId"]
+    assert observed["observedAtMs"] > 0 and observed["policyRevision"] == original_projection["revision"]
+    assert observed["projectionStatus"] == "applied" and len(observed["registrations"]) <= 100
+    assert len(observed["dialogs"]) <= 1000 and "password" not in json.dumps(observed).lower()
+    return observed
 
 deadline = time.monotonic() + 10
 while True:
@@ -39,6 +94,21 @@ assert applied["status"] == "applied" and applied["contentSha256"] == expected_h
 assert control("POST", original_projection)[1] == applied, "duplicate delivery changed acknowledgement"
 assert control("GET", token="invalid")[0] == 401
 assert control("GET", origin="https://query.example.test")[0] == 403
+if os.environ.get("SEAT_PRESENCE_TEST") == "1":
+    assert presence(token="invalid")[0] == 401
+    assert presence(origin="https://query.example.test")[0] == 403
+    assert presence(suffix="?unexpected=1")[0] == 400
+    initial_presence = checked_presence()
+    assert initial_presence["dialogs"] == [] and all(item["connections"] == 0 for item in initial_presence["registrations"])
+    sys.path.insert(0, "/opt/bitcall/seat")
+    from provisioning import ControlError, KamailioRpc
+    try:
+        KamailioRpc().call("unknown.presence.rpc")
+    except ControlError as error:
+        assert error.code == "GATEWAY_STATE_UNAVAILABLE"
+    else:
+        raise AssertionError("unknown private RPC unexpectedly succeeded")
+    print("PASS private presence authentication, empty observation and unknown RPC rejection")
 print("PASS private control authentication, canonical digest and idempotent apply")
 '''
 

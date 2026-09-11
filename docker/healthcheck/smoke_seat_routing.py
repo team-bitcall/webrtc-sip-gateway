@@ -198,6 +198,11 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
         call = uuid.uuid4().hex + "@phone.invalid"
         status, reg_headers = challenged("REGISTER", "sip:" + SEAT_DOMAIN, user, password, cseq, call); assert status.startswith("SIP/2.0 200 "), status
         assert len(reg_headers.get("contact", [])) == 1 and reg_headers["contact"][0].startswith("<sip:%s@browser.invalid;transport=ws>;expires=600" % user), "local Contact was not retained"
+        if os.environ.get("SEAT_PRESENCE_TEST") == "1":
+            expected_seat = next(item["id"] for item in original_projection["seats"] if item["username"] == user)
+            observed = checked_presence()
+            registration = next(item for item in observed["registrations"] if item["seatId"] == expected_seat)
+            assert registration["connections"] == 1 and observed["dialogs"] == [], observed
         uri = "sip:18005550100@" + SEAT_DOMAIN
         headers = ("Contact: <sip:phone@browser.invalid;transport=ws>", "P-K-CSeq-Auth: 9999", "P-K-CSeq-Refresh: 9999", "X-Bitcall-Tenant: forged", "P-Asserted-Identity: <sip:forged@example.test>", "Remote-Party-ID: <sip:forged@example.test>")
         if caller_id:
@@ -205,6 +210,10 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
         status, reply_headers = challenged("INVITE", uri, user, password, cseq + 2, call, extra=headers); assert status.startswith("SIP/2.0 200 "), status
         assert reply_headers["cseq"] == ["%d INVITE" % (cseq + 3)], reply_headers
         assert "contact" in reply_headers and "record-route" in reply_headers, reply_headers
+        if os.environ.get("SEAT_PRESENCE_TEST") == "1":
+            observed = checked_presence()
+            assert any(item["seatId"] == expected_seat and item["state"] in ("early", "confirmed")
+                       for item in observed["dialogs"]), observed
         target = reply_headers["contact"][0].split("<", 1)[1].split(">", 1)[0]
         to = reply_headers["to"][0]
         routes = list(reversed(reply_headers["record-route"]))
@@ -216,6 +225,15 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
             assert KamailioRpc().active_cdr_ids(), "active dialog inventory lost its journal ID"
         send_frame(ws, dialog_request("BYE", target, user, cseq + 4, call, to, routes))
         status, _ = parse(text(ws)); assert status.startswith("SIP/2.0 200 "), status
+        if os.environ.get("SEAT_PRESENCE_TEST") == "1":
+            deadline = time.monotonic() + 2
+            while True:
+                observed = checked_presence()
+                if not any(item["seatId"] == expected_seat for item in observed["dialogs"]): break
+                assert time.monotonic() < deadline, observed
+                time.sleep(.05)
+            registration = next(item for item in observed["registrations"] if item["seatId"] == expected_seat)
+            assert registration["connections"] == 1, observed
         expect_cdr(call, [("admitted", None, None, None), ("answered", 200, None, None),
                           ("ended", None, "normal", "agent")])
     # A policy-enabled seat may use one live WSS registration only. A second
@@ -290,6 +308,18 @@ with socket.create_connection(("127.0.0.1", 443), timeout=10) as raw:
                             ("ended", None, "normal", "agent")])
 t.join(3); assert not t.is_alive(), "carrier did not complete"
 if failures: raise failures[0]
+if os.environ.get("SEAT_PRESENCE_TEST") == "1":
+    deadline = time.monotonic() + 2
+    while True:
+        observed = checked_presence()
+        if observed["dialogs"] == [] and all(item["connections"] == 0 for item in observed["registrations"]): break
+        assert time.monotonic() < deadline, observed
+        time.sleep(.05)
+    ordered_latencies = sorted(presence_latencies_ms)
+    p95_index = max(0, (95 * len(ordered_latencies) + 99) // 100 - 1)
+    print("PASS private presence observation latency samples=%d maxMs=%.2f p95Ms=%.2f" %
+          (len(ordered_latencies), ordered_latencies[-1], ordered_latencies[p95_index]))
+    print("PASS private presence registration, dialog and closed-WSS observation")
 print("PASS local denial isolation")
 print("PASS owner password-profile upstream digest")
 print("PASS agent HA1-profile upstream digest")
@@ -340,6 +370,7 @@ def main():
     parser.add_argument("--source-overlay", action="store_true")
     parser.add_argument("--managed", action="store_true", help="exercise private control provisioning before and after the same calls")
     parser.add_argument("--call-events", action="store_true", help="assert managed call-event journaling through the private control API")
+    parser.add_argument("--presence", action="store_true", help="assert private live registration and dialog observation")
     parser.add_argument("--events-output", type=Path, help="save synthetic exported events for backend contract validation")
     args = parser.parse_args()
     root = args.gateway_root.resolve()
@@ -347,6 +378,8 @@ def main():
         parser.error("managed mode validates the packaged image only")
     if args.call_events and not args.managed:
         parser.error("call events require --managed")
+    if args.presence and not args.call_events:
+        parser.error("presence requires --managed --call-events")
     if args.events_output and not args.call_events:
         parser.error("events output requires --call-events")
     files = {"config": root / "docker/kamailio/kamailio.cfg", "seat config": root / "docker/kamailio/seat-routing.cfg", "renderer": root / "docker/rootfs/etc/cont-init.d/07-render-kamailio-cfg", "compiler": root / "docker/seat/compile_snapshot.py"}
@@ -379,6 +412,8 @@ def main():
         control_env = ["-e", "SEAT_CONTROL_TOKEN=" + "a" * 43, "-e", "SEAT_STATE_DIR=/var/lib/bitcall-seat", "--mount", f"type=volume,source={name}-state,target=/var/lib/bitcall-seat"] if args.managed else []
         if args.call_events:
             control_env += ["-e", "SEAT_CALL_EVENTS=1"]
+        if args.presence:
+            control_env += ["-e", "SEAT_PRESENCE_TEST=1"]
         initialize = "umask 077; cp /fixture-seats.json /tmp/seat-snapshot.json; "
         if args.managed:
             initialize += "chmod 700 /var/lib/bitcall-seat; "
