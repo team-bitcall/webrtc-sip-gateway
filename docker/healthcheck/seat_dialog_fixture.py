@@ -152,17 +152,29 @@ def carrier():
             timed_out, _ = sock.recvfrom(65535); timed_out = timed_out.decode(); line, timeout_request_h = parse(timed_out)
             assert line.startswith("INVITE "), line
             sock.settimeout(.25)
+            pending_dialog_invite = None
             while not timeout_case_done.is_set():
                 try:
-                    retransmission, _ = sock.recvfrom(65535); retransmission = retransmission.decode(); repeat_line, repeat_h = parse(retransmission)
-                    assert repeat_line.startswith("INVITE ") and repeat_h["call-id"] == timeout_request_h["call-id"], repeat_line
+                    retransmission, retransmission_peer = sock.recvfrom(65535); retransmission = retransmission.decode(); repeat_line, repeat_h = parse(retransmission)
+                    if repeat_h.get("call-id") != timeout_request_h["call-id"]:
+                        # The browser sets timeout_case_done before sending the
+                        # next case. recvfrom may already be blocked and consume
+                        # that datagram before this loop rechecks the event.
+                        assert timeout_case_done.is_set() and repeat_line.startswith("INVITE "), repeat_line
+                        pending_dialog_invite = (retransmission, retransmission_peer)
+                        break
+                    assert repeat_line.startswith("INVITE "), repeat_line
                 except socket.timeout:
                     pass
             sock.settimeout(6)
             # Keep one established dialog through browser/provider re-INVITEs,
             # a second-WSS spoof, a separate retransmission, and lease expiry.
             while True:
-                invite, peer = sock.recvfrom(65535); invite = invite.decode(); line, h = parse(invite)
+                if pending_dialog_invite:
+                    invite, peer = pending_dialog_invite; pending_dialog_invite = None
+                else:
+                    invite, peer = sock.recvfrom(65535); invite = invite.decode()
+                line, h = parse(invite)
                 if line.startswith("INVITE ") and h["call-id"] != timeout_request_h["call-id"]: break
             dialog_call = h["call-id"][0]
             record_routes = "".join("Record-Route: " + value + "\r\n" for value in h.get("record-route", []))
