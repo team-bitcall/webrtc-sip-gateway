@@ -10,7 +10,14 @@ import unittest
 from unittest import mock
 
 from recording_capture import CaptureError
-from recording_runtime import ReadOnlyProjection, RecordingRuntime, enabled, load_config
+from recording_runtime import (
+    RuntimeConfigError,
+    ReadOnlyProjection,
+    RecordingRuntime,
+    _retention_config,
+    enabled,
+    load_config,
+)
 from recording_transport import (
     RecordingTransportError,
     RecordingTransportServer,
@@ -175,6 +182,39 @@ class RuntimeTests(unittest.TestCase):
                 }
             )
 
+    def test_capture_mode_defaults_to_pcap_and_only_subscription_is_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("state", "spool", "output"):
+                directory = root / name
+                directory.mkdir(mode=0o700)
+                os.chmod(directory, 0o700)
+            base = {
+                "SEAT_MODE": "managed",
+                "SEAT_RECORDING_ENABLED": "1",
+                "SEAT_CALL_EVENTS": "1",
+                "SEAT_STATE_DIR": str(root / "state"),
+                "SEAT_RECORDING_SPOOL_DIR": str(root / "spool"),
+                "SEAT_RECORDING_OUTPUT_DIR": str(root / "output"),
+                "SEAT_RECORDING_GATEWAY_ID": "https://gateway.test",
+            }
+            with (
+                mock.patch("recording_storage.prepare_storage"),
+                mock.patch(
+                    "recording_binding.validate_gateway_id",
+                    return_value="https://gateway.test",
+                ),
+            ):
+                self.assertEqual(load_config(base)["capture_mode"], "pcap")
+                self.assertEqual(
+                    load_config(
+                        {**base, "SEAT_RECORDING_CAPTURE_MODE": "subscription"}
+                    )["capture_mode"],
+                    "subscription",
+                )
+                with self.assertRaises(RuntimeConfigError):
+                    load_config({**base, "SEAT_RECORDING_CAPTURE_MODE": "invalid"})
+
     def test_periodic_finishes_only_five_capturing_rows(self):
         class Controller:
             def __init__(self):
@@ -204,6 +244,7 @@ class RuntimeTests(unittest.TestCase):
 
         runtime = RecordingRuntime.__new__(RecordingRuntime)
         runtime.controller = Controller()
+        runtime.retention = None
         runtime.periodic()
         self.assertTrue(runtime.controller.ticked)
         self.assertEqual(
@@ -273,6 +314,25 @@ class RuntimeTests(unittest.TestCase):
         runtime.failure_counts = {"periodic": 0, "finish": 0, "transport": 0}
         runtime.periodic()
         self.assertEqual(runtime.failure_counts["periodic"], 1)
+
+
+class RetentionConfigurationTests(unittest.TestCase):
+    def test_retention_requires_both_explicit_bounded_durations(self):
+        self.assertIsNone(_retention_config({}))
+        failed = "SEAT_RECORDING_FAILED_RETENTION_SECONDS"
+        stored = "SEAT_RECORDING_STORED_RETENTION_SECONDS"
+        self.assertEqual(
+            _retention_config({failed: "86400", stored: "604800"}),
+            {"failed_after_s": 86400, "stored_after_s": 604800},
+        )
+        for values in (
+            {failed: "1"},
+            {failed: "0", stored: "1"},
+            {failed: "1", stored: "31536001"},
+            {failed: "١", stored: "1"},
+        ):
+            with self.assertRaises(RuntimeConfigError):
+                _retention_config(values)
 
 
 if __name__ == "__main__":

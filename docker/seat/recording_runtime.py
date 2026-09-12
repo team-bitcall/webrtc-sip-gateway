@@ -13,6 +13,8 @@ from urllib.parse import quote
 from media_control import NgClient
 from recording_capture import CaptureController
 from media_journal import media_checkpoint
+from recording_retention import RecordingRetention
+from recording_subscription import SubscriptionProducer
 from recording_transport import (
     RecordingTransportError,
     RecordingTransportServer,
@@ -127,6 +129,17 @@ class ReadOnlyProjection:
         }
 
 
+def _retention_config(environ):
+    names = ("SEAT_RECORDING_FAILED_RETENTION_SECONDS", "SEAT_RECORDING_STORED_RETENTION_SECONDS")
+    values = [environ.get(name) for name in names]
+    if all(value is None for value in values):
+        return None
+    if any(not isinstance(value, str) or not value.isascii() or not value.isdigit()
+           or not 1 <= int(value) <= 365 * 24 * 3600 for value in values):
+        raise RuntimeConfigError("both recording retention durations must be explicit seconds within 1 year")
+    return {"failed_after_s": int(values[0]), "stored_after_s": int(values[1])}
+
+
 def load_config(environ=None):
     """Validate all recording paths before any capture worker starts."""
     environ = os.environ if environ is None else environ
@@ -154,10 +167,14 @@ def load_config(environ=None):
         raise RuntimeConfigError(
             "recording storage or gateway identity is invalid"
         ) from error
+    mode = environ.get("SEAT_RECORDING_CAPTURE_MODE", "pcap")
+    if mode not in {"pcap", "subscription"}:
+        raise RuntimeConfigError("unsupported recording capture mode")
     state = private_directory(environ["SEAT_STATE_DIR"])
     spool = private_directory(environ["SEAT_RECORDING_SPOOL_DIR"])
     output = private_directory(environ["SEAT_RECORDING_OUTPUT_DIR"])
-    return {"state": state, "spool": spool, "output": output, "gateway_id": gateway_id}
+    return {"state": state, "spool": spool, "output": output, "gateway_id": gateway_id,
+            "retention": _retention_config(environ), "capture_mode": mode}
 
 
 def dispatch(controller, tenant, request, gateway_id, now_ms=None, validator=None):
@@ -193,10 +210,11 @@ class RecordingRuntime:
         self.projection = None
         self.controller = None
         self.server = None
+        self.retention = None
         self.validator = validator
         self.stopping = False
         self.last_tick = 0.0
-        self.failure_counts = {"periodic": 0, "finish": 0, "transport": 0}
+        self.failure_counts = {"periodic": 0, "finish": 0, "transport": 0, "retention": 0}
         try:
             if self.rpc is None:
                 from provisioning import KamailioRpc
@@ -214,6 +232,12 @@ class RecordingRuntime:
                 output=config["output"],
                 media_guard=lambda call_id, require_closed=False: media_checkpoint(self.journal, call_id, require_closed),
             )
+            if config.get("capture_mode", "pcap") == "subscription":
+                self.controller.producer = SubscriptionProducer(
+                    self.controller.ng, self.controller.pcaps, self.controller.metadata,
+                    self.controller.limits["maxInputBytes"], self.controller.limits["maxPackets"],
+                )
+            self.retention = RecordingRetention(self.controller, **(config.get("retention") or {}))
             self.server = RecordingTransportServer(
                 config["state"],
                 lambda tenant, request: dispatch(
@@ -263,6 +287,12 @@ class RecordingRuntime:
                 )
             except Exception:
                 self._failed("finish")
+
+        if self.retention is not None:
+            try:
+                self.retention.sweep(limit=5)
+            except Exception:
+                self._failed("retention")
 
     def run(self):
         """Run without TCP listeners; all work remains local and bounded."""

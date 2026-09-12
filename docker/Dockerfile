@@ -52,7 +52,7 @@ COPY kamailio/call-events.cfg /opt/bitcall/call-events.cfg
 COPY kamailio/recording-media.cfg /opt/bitcall/recording-media.cfg
 COPY seat/compile_snapshot.py /opt/bitcall/compile_seat_snapshot.py
 COPY seat/compile_snapshot.py seat/call_journal.py seat/media_control.py seat/media_watchdog.py seat/provisioning.py /opt/bitcall/seat/
-COPY seat/media_journal.py seat/recording_artifacts.py seat/recording_cleanup.py seat/recording_capture.py seat/recording_decode.py seat/recording_binding.py seat/recording_storage.py seat/recording_runtime.py seat/recording_transport.py /opt/bitcall/seat/
+COPY seat/recording_subscription.py seat/recording_retention.py seat/recording_staging.py seat/media_journal.py seat/recording_artifacts.py seat/recording_cleanup.py seat/recording_capture.py seat/recording_decode.py seat/recording_binding.py seat/recording_storage.py seat/recording_runtime.py seat/recording_transport.py /opt/bitcall/seat/
 COPY kamailio/tls.cfg /etc/kamailio/tls.cfg
 COPY healthcheck/healthcheck_server.py /opt/bitcall/healthcheck_server.py
 COPY rootfs/ /

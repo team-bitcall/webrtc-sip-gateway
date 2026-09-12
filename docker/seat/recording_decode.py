@@ -18,6 +18,8 @@ from pathlib import Path
 import stat
 import struct
 
+from recording_staging import create_staging, remove_staging
+
 RATE = 8000
 WAV_HEADER = 44
 MAX_DURATION = 3600
@@ -63,6 +65,26 @@ def _private_file(path: Path) -> int:
         os.close(fd)
         _fail("capture must be a private 0600 regular single-link file")
     return fd
+
+
+def _staging_file(path: Path) -> int:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.fchmod(fd, 0o600)
+        return fd
+    except Exception:
+        os.close(fd)
+        raise
+
+
+def _publication_identity(path: Path) -> dict:
+    fd = _private_file(path)
+    try:
+        info = os.fstat(fd)
+        return {"dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
+                "uid": info.st_uid, "mode": stat.S_IMODE(info.st_mode)}
+    finally:
+        os.close(fd)
 
 
 def _private_directory(path: Path) -> Path:
@@ -151,6 +173,8 @@ def _validate(
         or len(epoch["sources"]) != 2
     ):
         _fail("epoch requires exactly two sources")
+    if epoch.get("captureMode", "pcap-v1") not in {"pcap-v1", "subscription-v1"}:
+        _fail("unsupported capture mode")
     started, ended = epoch.get("startedAtUs"), epoch.get("endedAtUs")
     if not _integer(started) or not _integer(ended) or not 0 <= started < ended:
         _fail("invalid epoch window")
@@ -334,9 +358,12 @@ def _wav_header(data_bytes: int) -> bytes:
 
 
 def finalize_capture(
-    pcap_path, output_directory, manifest_id32hex, binding, epoch, limits
+    pcap_path, output_directory, manifest_id32hex, binding, epoch, limits, *,
+    on_publish=None,
 ):
     """Finalize selected two-leg RTP as an atomic stereo PCM16 WAV and manifest."""
+    if on_publish is not None and not callable(on_publish):
+        raise TypeError("on_publish must be callable")
     manifest_id = _hex32(manifest_id32hex, "manifest id")
     checked, sources, max_in, max_out, max_seconds, max_packets = _validate(
         binding, epoch, limits
@@ -358,25 +385,16 @@ def finalize_capture(
     if capture_size > max_in:
         os.close(fd)
         _fail("capture exceeds input limit")
-    temps: list[Path] = []
+    staging = None
     live_mono_fds: set[int] = set()
     try:
+        staging = create_staging(directory, manifest_id)
         mono = []
         for index in range(2):
-            name = (
-                ".recording-"
-                + manifest_id
-                + "-"
-                + str(os.getpid())
-                + "-"
-                + str(index)
-                + ".part"
-            )
-            path = directory / name
-            tfd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            path = staging / ("mono-" + str(index) + ".part")
+            tfd = _staging_file(path)
             mono.append((path, tfd))
             live_mono_fds.add(tfd)
-            temps.append(path)
         state = [
             {
                 "first_cap": None,
@@ -390,6 +408,7 @@ def finalize_capture(
             for _ in sources
         ]
         packet_count = 0
+        subscription = epoch.get("captureMode") == "subscription-v1"
         common_start = epoch["startedAtUs"]
         for captured_at, raw in _pcap(fd, capture_size):
             packet_count += 1
@@ -422,11 +441,24 @@ def finalize_capture(
             index = candidates[0]
             source = sources[index]
             seq, timestamp, ssrc, encoded = _rtp(payload)
-            if ssrc != source["ssrc"] or (payload[1] & 127) != source["payloadType"]:
+            payload_type = payload[1] & 127
+            if subscription:
+                # The producer binds each socket to one native source tag and
+                # writes its fixed synthetic tuple. PT 0/8 have immutable G.711
+                # meanings; source address/SSRC changes cannot change the leg.
+                if payload_type not in (0, 8):
+                    _fail("unsupported subscription codec")
+            elif ssrc != source["ssrc"] or payload_type != source["payloadType"]:
                 _fail("conflicting selected source")
             if len(encoded) > MAX_PACKET:
                 _fail("oversized RTP payload")
             item = state[index]
+            if subscription and item.get("media_key") != (ssrc, payload_type):
+                epochs = item.get("epochs", 0) + 1
+                if epochs > 128:
+                    _fail("subscription epoch limit exceeded")
+                item.update(first_cap=None, first_rtp=None, last_seq=None, last_ts=None,
+                            seen=deque(maxlen=128), media_key=(ssrc, payload_type), epochs=epochs)
             fingerprint = (seq, timestamp, hashlib.sha256(encoded).digest())
             same_sequence = [known for known in item["seen"] if known[0] == seq]
             if same_sequence:
@@ -460,7 +492,8 @@ def finalize_capture(
             if end > max_seconds * RATE or WAV_HEADER + end * 4 > max_out:
                 _fail("output limit exceeded")
             os.lseek(mono[index][1], start * 2, os.SEEK_SET)
-            _write_all(mono[index][1], _pcm(source["codec"], encoded))
+            codec = ("PCMU" if payload_type == 0 else "PCMA") if subscription else source["codec"]
+            _write_all(mono[index][1], _pcm(codec, encoded))
             item["last_seq"], item["last_ts"], item["end"], item["nonempty"] = (
                 seq,
                 timestamp,
@@ -478,9 +511,8 @@ def finalize_capture(
             os.fsync(tfd)
             os.close(tfd)
             live_mono_fds.discard(tfd)
-        wav_temp = directory / (".recording-" + manifest_id + "-wav.part")
-        outfd = os.open(wav_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        temps.append(wav_temp)
+        wav_temp = staging / "audio.part"
+        outfd = _staging_file(wav_temp)
         try:
             _write_all(outfd, _wav_header(data_size))
             with ExitStack() as stack:
@@ -515,9 +547,8 @@ def finalize_capture(
             "sizeBytes": WAV_HEADER + data_size,
             "contentType": "audio/wav",
         }
-        manifest_temp = directory / (".recording-" + manifest_id + "-manifest.part")
-        mfd = os.open(manifest_temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        temps.append(manifest_temp)
+        manifest_temp = staging / "manifest.part"
+        mfd = _staging_file(manifest_temp)
         try:
             _write_all(
                 mfd,
@@ -527,14 +558,14 @@ def finalize_capture(
             os.fsync(mfd)
         finally:
             os.close(mfd)
+        if on_publish is not None:
+            on_publish({"wav": _publication_identity(wav_temp),
+                        "manifest": _publication_identity(manifest_temp)})
         os.link(wav_temp, wav_final)
         wav_temp.unlink()
-        temps.remove(wav_temp)
         os.link(manifest_temp, manifest_final)
         manifest_temp.unlink()
-        temps.remove(manifest_temp)
-        for path in temps:
-            path.unlink(missing_ok=True)
+        remove_staging(directory, manifest_id)
         dirfd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(dirfd)
@@ -547,10 +578,10 @@ def finalize_capture(
                 os.close(tfd)
             except OSError:
                 pass
-        for path in temps:
+        if staging is not None:
             try:
-                path.unlink()
-            except FileNotFoundError:
+                remove_staging(directory, manifest_id)
+            except Exception:
                 pass
         raise
     finally:

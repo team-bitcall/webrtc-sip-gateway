@@ -99,6 +99,15 @@ jobs:
           python3 docker/healthcheck/smoke_media_capabilities.py \
             --image webrtc-sip-gateway:media-proof
 
+      - name: Native subscription source-leg mapping
+        run: python3 docker/healthcheck/smoke_recording_mapping.py --image webrtc-sip-gateway:media-proof
+
+      - name: Native subscription recorder lifecycle
+        run: python3 docker/healthcheck/smoke_native_recording.py --image webrtc-sip-gateway:media-proof
+
+      - name: Native subscription capture capacity
+        run: python3 docker/healthcheck/smoke_recording_capacity.py --image webrtc-sip-gateway:media-proof
+
       - name: Generate temporary TLS cert for runtime tests
         run: |
           mkdir -p "$GITHUB_WORKSPACE/.ci-ssl"

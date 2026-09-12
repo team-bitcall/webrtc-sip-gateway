@@ -197,13 +197,53 @@ class RecordingDecodeTests(unittest.TestCase):
         )
         self.assertTrue((self.root / ("1" * 32 + ".wav")).is_file())
 
-    def test_preexisting_part_is_not_deleted(self):
+    def test_publication_receipt_is_private_and_persisted_before_final_links(self):
+        sound = bytes(ulaw(500) for _ in range(160))
+        self.write([
+            (1_010_000, packet("10.0.0.1", 10001, 20001, rtp(1, 0, 11, sound))),
+            (1_010_000, packet("10.0.0.2", 10002, 20002, rtp(1, 0, 22, sound))),
+        ])
+        manifest_id = "4" * 32
+        received = []
+
+        def persist(receipt):
+            self.assertFalse((self.root / (manifest_id + ".wav")).exists())
+            self.assertFalse((self.root / (manifest_id + ".json")).exists())
+            self.assertEqual(set(receipt), {"wav", "manifest"})
+            self.assertTrue(all(set(value) == {"dev", "ino", "size", "uid", "mode"}
+                                for value in receipt.values()))
+            for role, name in (("wav", "audio.part"), ("manifest", "manifest.part")):
+                info = (self.root / (".recording-" + manifest_id) / name).stat()
+                self.assertEqual(receipt[role], {"dev": info.st_dev, "ino": info.st_ino,
+                    "size": info.st_size, "uid": info.st_uid, "mode": info.st_mode & 0o777})
+                self.assertEqual((info.st_nlink, receipt[role]["mode"]), (1, 0o600))
+            received.append(receipt)
+
+        finalize_capture(self.capture, self.root, manifest_id, self.binding, self.epoch,
+                         self.limits, on_publish=persist)
+        self.assertEqual(len(received), 1)
+        for role, suffix in (("wav", ".wav"), ("manifest", ".json")):
+            info = (self.root / (manifest_id + suffix)).stat()
+            self.assertEqual((received[0][role]["dev"], received[0][role]["ino"]),
+                             (info.st_dev, info.st_ino))
+
+        failed_id = "5" * 32
+        def reject(_receipt):
+            raise RuntimeError("receipt persistence failed")
+        with self.assertRaisesRegex(RuntimeError, "receipt persistence failed"):
+            finalize_capture(self.capture, self.root, failed_id, self.binding, self.epoch,
+                             self.limits, on_publish=reject)
+        self.assertFalse((self.root / (failed_id + ".wav")).exists())
+        self.assertFalse((self.root / (failed_id + ".json")).exists())
+        self.assertFalse((self.root / (".recording-" + failed_id)).exists())
+
+    def test_legacy_pid_part_is_outside_recovery_boundary(self):
         self.write([])
         name = ".recording-" + "2" * 32 + "-" + str(os.getpid()) + "-0.part"
         foreign = self.root / name
         foreign.write_bytes(b"keep")
         os.chmod(foreign, 0o600)
-        with self.assertRaises(FileExistsError):
+        with self.assertRaises(RecordingDecodeError):
             finalize_capture(
                 self.capture, self.root, "2" * 32, self.binding, self.epoch, self.limits
             )

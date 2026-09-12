@@ -95,6 +95,36 @@ class NG:
         return {"result": "ok", "tags": tags}
 
 
+class Producer:
+    def __init__(self, health_error=False):
+        self.controller = None
+        self.health_error = health_error
+        self.stop_pending_seen = []
+        self.stops = 0
+
+    def start(self, _row, _tags):
+        pass
+
+    def health(self, _row):
+        if self.health_error:
+            raise OSError("producer unavailable")
+
+    def finish(self, _row):
+        pass
+
+    def stop(self, row):
+        self.stops += 1
+        if self.controller is not None:
+            pending = self.controller.db.execute(
+                "SELECT stop_pending FROM captures WHERE manifest_id=?",
+                (row["manifest_id"],),
+            ).fetchone()[0]
+            self.stop_pending_seen.append(pending)
+
+    def close(self):
+        pass
+
+
 class Tests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -328,6 +358,87 @@ class Tests(unittest.TestCase):
                 result = self.c.handle(TEN, {"action": "finish", "callId": CALL, "manifestId": MAN})
                 self.assertEqual(result["state"], "failed")
                 self.assertEqual(list((self.r / "out").iterdir()), [])
+
+    def test_native_health_failure_persists_cleanup_intent_before_stop(self):
+        producer = Producer(health_error=True)
+        self.c.close()
+        self.c = self.make(producer=producer)
+        producer.controller = self.c
+        self.c.clock = lambda: 1_000_000
+        self.start()
+        self.j.end()
+        self.rpc.active, self.ng.unknown = set(), True
+
+        result = self.c.handle(
+            TEN, {"action": "finish", "callId": CALL, "manifestId": MAN}
+        )
+
+        self.assertEqual(result["state"], "failed")
+        self.assertEqual(result["errorCode"], "RECORDING_FINALIZE_FAILED")
+        self.assertEqual(producer.stop_pending_seen, [1])
+        self.assertEqual(
+            self.c.db.execute("SELECT stop_pending FROM captures").fetchone()[0], 0
+        )
+        self.assertNotIn("stop recording", [x["command"] for x in self.ng.calls])
+
+    def test_native_missing_producer_retries_without_legacy_ng_stop(self):
+        self.start()
+        row = self.c.db.execute("SELECT epoch FROM captures").fetchone()
+        epoch = json.loads(row["epoch"])
+        epoch["captureMode"] = "subscription-v1"
+        with self.c.db:
+            self.c.db.execute(
+                "UPDATE captures SET epoch=? WHERE manifest_id=?",
+                (json.dumps(epoch), MAN),
+            )
+        self.j.end()
+        self.rpc.active, self.ng.unknown = set(), True
+
+        result = self.c.handle(
+            TEN, {"action": "finish", "callId": CALL, "manifestId": MAN}
+        )
+        self.assertEqual(result["errorCode"], "RECORDING_MEDIA_UNAVAILABLE")
+        self.assertEqual(
+            self.c.db.execute("SELECT stop_pending FROM captures").fetchone()[0], 1
+        )
+        self.c.tick()
+        pending = self.c.db.execute(
+            "SELECT stop_pending FROM captures WHERE manifest_id=?", (MAN,)
+        ).fetchone()[0]
+        self.assertEqual(pending, 1)
+        self.assertNotIn("stop recording", [x["command"] for x in self.ng.calls])
+
+    def test_native_same_revision_requires_initial_digest(self):
+        initial = {"revision": 3, "digest": "a" * 64}
+
+        def guard(_call_id, require_closed=False):
+            return {
+                "revision": 3,
+                "digest": ("b" if require_closed else "a") * 64,
+                "closed": require_closed,
+            }
+
+        producer = Producer()
+        self.c.close()
+        self.c = self.make(media_guard=guard, producer=producer)
+        producer.controller = self.c
+        self.c.clock = lambda: 1_000_000
+        self.start()
+        stored = json.loads(
+            self.c.db.execute("SELECT epoch FROM captures").fetchone()["epoch"]
+        )
+        self.assertEqual(stored["mediaCheckpoint"], initial)
+        self._closed_files()
+        self.j.end()
+        self.rpc.active, self.ng.unknown = set(), True
+
+        with mock.patch("recording_capture.finalize_capture") as finalize:
+            result = self.c.handle(
+                TEN, {"action": "finish", "callId": CALL, "manifestId": MAN}
+            )
+
+        self.assertEqual(result["errorCode"], "RECORDING_MEDIA_CHANGED")
+        finalize.assert_not_called()
 
 
 if __name__ == "__main__":

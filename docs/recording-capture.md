@@ -1,6 +1,8 @@
 # Private recording capture runtime
 
-Task 14a integration checkpoint, 2026-09-12. This is an opt-in stable-media pilot, not customer recording activation. Standalone and legacy gateway startup keep their existing behavior.
+Task 14 recording-capture pilot, 2026-09-12. Customer policy and automatic
+selection remain a Task 15 decision; standalone and legacy gateway startup keep
+their existing behavior.
 
 ## Process and trust boundary
 
@@ -29,8 +31,10 @@ Responses contain `callId`, `manifestId`, `state`, and an optional safe `errorCo
 - `SEAT_STATE_DIR`: existing private durable seat-state directory.
 - `SEAT_RECORDING_SPOOL_DIR`: existing canonical owned 0700 directory on a filesystem with total capacity at most **128 MiB** for this pilot. The initializer creates private `pcaps`, `metadata`, `tmp` subdirectories. A directory on a large disk is not a hard bound and is rejected.
 - `SEAT_RECORDING_OUTPUT_DIR`: separate existing canonical owned 0700 directory; it cannot overlap/nest with raw spool.
+- `SEAT_RECORDING_CAPTURE_MODE`: defaults to `pcap`. `subscription` is an explicit native RTPengine-subscription pilot and adds the named loopback RTPengine interface `recording/127.0.0.1` at startup. Do not select it unless that loopback-only interface is available to the recorder.
+- `SEAT_RECORDING_FAILED_RETENTION_SECONDS` and `SEAT_RECORDING_STORED_RETENTION_SECONDS`: retention is disabled unless **both** are explicit ASCII decimal durations in the inclusive range 1–31,536,000 seconds. Supplying only one, zero, or an out-of-range value prevents the recording runtime from starting.
 
-The initializer validates storage before RTPengine receives its recording flags. The worker retries startup through s6 if journal/projection initialization is not yet ready. Files remain 0600. The opt-in backend handoff worker delivers finalized artifacts and acknowledges verified S3 storage; the gateway then reclaims only those acknowledged files. Failed-capture disposal and tombstone retention remain separate policy gates. Use dedicated durable volumes for an actual pilot; the media fixture uses tmpfs and does not prove durability.
+The initializer validates storage before RTPengine receives its recording flags. The worker retries startup through s6 if journal/projection initialization is not yet ready. Files remain 0600. The opt-in backend handoff worker delivers finalized artifacts and acknowledges verified S3 storage; the gateway then reclaims only those acknowledged files. Retention code is present but remains off without its paired explicit durations; enabling customer policy is a separate Task 15 decision. Use dedicated durable volumes for an actual pilot; the media fixture uses tmpfs and does not prove durability.
 
 The backend additionally requires `teamRecordingCapture: {"enabled": true}` in its existing protected team-auth config, enabled gateway provisioning/call events, configured seat routing, an eligible customer tenant, recording entitlement, and a currently answered complete-enough CDR. It exposes an internal service and an explicit operator command:
 
@@ -42,11 +46,19 @@ node backend/scripts/run-recording-capture.mjs finish TENANT PUBLIC_CALL_ID
 
 These load the existing protected config and Mongo environment. They add no browser/admin/panel endpoint. Status/finish can still reconcile an existing scoped capture after recording entitlement revocation. Per-agent/global automatic selection is task 15.
 
-## Limits and remaining gates
+## Limits, retirement, and remaining gates
 
-One worker, at most five captures, 100 stored jobs; bounded per-pass finalization, input packets/bytes, output bytes and duration. Unix reads have total deadlines, strict framing and mode-0600 socket ownership. SIGTERM closes handles/socket; a later restart marks interrupted captures unavailable and retries safe recording stop without deleting voice calls.
+One worker permits at most five active captures and 100 capture rows. Periodic finalization considers at most five capturing rows, and an enabled retention sweep considers at most five terminal failed/stored rows per pass. Input packets/bytes, output bytes and duration are bounded. Unix reads have total deadlines, strict framing and mode-0600 socket ownership. SIGTERM closes handles/socket; a later restart marks interrupted captures unavailable and retries safe recording stop without deleting voice calls.
 
-Only stable IPv4 PCMU/PCMA 8 kHz, two source legs. Media changes/reorder/overlap remain unsupported and fail closed. Authoritative SDP epochs, replay-tombstone/failed-capture retention, storage-full behavior and broader capacity/codec acceptance remain open. Do not enable customers from this checkpoint.
+Retirement is deliberately conservative. It proceeds only after the configured failed/stored age, terminal journal evidence, no active CDR from the trusted RPC view, and RTPengine NG `query` confirmation that the call is gone. Failed rows additionally require an exact private-file inventory and identity revalidation before unlinking; stored rows require the durable cleanup receipt. A failed check leaves the row and files in place for a later bounded retry.
+
+The default `pcap` mode remains a stable-media guard: one audio IPv4 G.711
+PT0/PT8 source per leg, with two source legs. It rejects unsupported media epochs.
+The opt-in `subscription` mode uses two native RTPengine subscriptions bound to
+the exact ordered from-tags. It accepts a source port/SSRC rollover, re-INVITE,
+and ICE/DTLS restart only when the journal has the corresponding applied and closed
+checkpoint; native proof covers PCMA as well as PCMU. Non-IPv4 media, codecs outside
+G.711 PT0/PT8, and broader topology/codec policy remain outside this pilot.
 
 ## Finalized artifact handoff
 
@@ -77,14 +89,18 @@ retries work even after some files are missing. Different receipts reject.
 
 At most five pending cleanups are retried per tick with a persisted rotating cursor.
 A replaced file or failed unlink/fsync preserves the pending receipt for recovery.
-`stored` tombstones prevent duplicate capture on replay; they still count toward the
-100-job limit. Tombstone compaction and failed-capture disposal are **not** implemented.
-A successful cleanup therefore reclaims audio bytes, not unlimited recording capacity.
+The receipt, exact inventory, and staged publication recovery make acknowledgement
+and cleanup crash-safe; the staging and receipt recovery paths have dedicated proof.
+`stored` tombstones prevent duplicate capture on replay and still count toward the
+100-job limit until an explicitly configured retention sweep retires an eligible
+terminal row. Old PID-era legacy orphans and unknown files are never inferred or
+deleted automatically; operators handle them manually.
 
-The spool is temporary but required for the current PCAP/finalization pipeline.
-Long-term audio lives in S3. Files remain until the trusted backend confirms verified
-storage; gateway state and receipts must survive restart. S3 lifecycle policy must
-preserve objects for the promised customer retention period.
+The spool is temporary but still required for the current PCAP/finalization pipeline;
+S3 does not provide direct capture input. Long-term audio lives in S3. Files remain
+until the trusted backend confirms verified storage; gateway state and receipts must
+survive restart. S3 lifecycle policy must preserve objects for the promised customer
+retention period.
 
 ## Durable media observation guard
 
@@ -108,6 +124,8 @@ sets uncertainty; PRACK retains the existing managed-route rejection. SIP routin
 continues if the journal is unavailable. Observation writes use the existing bounded
 HTTP timeout, so outage may add signaling latency while refusing recording.
 
-This guard does not decode multiple media epochs. Exact codec/transport/source-leg
-mapping to RTPengine packet boundaries, ICE restart and re-INVITE acceptance remain
-open. The stable IPv4 PCMU/PCMA pilot restriction remains in force.
+The guard does not broaden the pilot beyond the selected capture mode. The native
+subscription proofs cover exact source-leg mapping through port/SSRC rollover,
+re-INVITE, real ICE/DTLS restart, and PCMA; the default PCAP guard remains
+stable-media-only. CI runs the source-leg mapping, native lifecycle, and capacity
+proofs against the already built isolated media-proof image.

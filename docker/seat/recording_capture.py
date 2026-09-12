@@ -94,6 +94,7 @@ class CaptureController:
         maxConcurrent=5,
         maxJobs=100,
         media_guard=None,
+        producer=None,
     ):
         self.lock = threading.RLock()
         self.db = None
@@ -102,6 +103,7 @@ class CaptureController:
         if media_guard is not None and not callable(media_guard):
             raise ValueError("media_guard must be callable")
         self.media_guard = media_guard
+        self.producer = producer
         try:
             self.directory, self.spool, self.output = (
                 _dir(directory),
@@ -167,6 +169,9 @@ class CaptureController:
             if "metadata" not in {x[1] for x in self.db.execute("PRAGMA table_info(captures)")}:
                 with self.db:
                     self.db.execute("ALTER TABLE captures ADD COLUMN metadata TEXT")
+            if "publication" not in {x[1] for x in self.db.execute("PRAGMA table_info(captures)")}:
+                with self.db:
+                    self.db.execute("ALTER TABLE captures ADD COLUMN publication TEXT")
             self.db.execute(
                 """CREATE TABLE IF NOT EXISTS recording_cleanup(manifest_id TEXT PRIMARY KEY NOT NULL,tenant_id TEXT NOT NULL,call_id TEXT NOT NULL,manifest_sha256 TEXT NOT NULL,wav_sha256 TEXT NOT NULL,size_bytes INTEGER NOT NULL,inventory TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','stored')))"""
             )
@@ -252,7 +257,11 @@ class CaptureController:
         with self.lock:
             if not self.closed:
                 self.closed = True
-                self._release()
+                try:
+                    if self.producer is not None:
+                        self.producer.close()
+                finally:
+                    self._release()
 
     def _err(self, c, s=409):
         raise CaptureError(c, s)
@@ -448,9 +457,16 @@ class CaptureController:
 
     def _stop(self, r):
         try:
-            reply = self.ng.request(
-                {"command": "stop recording", "call-id": r["sip_call_id"]}
-            )
+            native = json.loads(r["epoch"] or "{}").get("captureMode") == "subscription-v1"
+            if native:
+                if self.producer is None:
+                    return False
+                self.producer.stop(dict(r))
+                reply = {"result": "ok"}
+            else:
+                reply = self.ng.request(
+                    {"command": "stop recording", "call-id": r["sip_call_id"]}
+                )
             ok = isinstance(reply, dict) and (
                 reply.get("result") == "ok"
                 or (
@@ -504,6 +520,11 @@ class CaptureController:
             sip, tags = self._resolve(t, v["callId"])
             query = self.ng.request({"command": "query", "call-id": sip})
             sources = self._source(query, tags)
+            if self.producer is not None:
+                # Preserve the verified initial codec/SSRC for audit; only the
+                # transport selector changes to our per-leg synthetic tuple.
+                sources = [{**source, "address": "127.0.0.1", "port": 10001 + i,
+                            "relayPort": 20001 + i} for i, source in enumerate(sources)]
             if query.get("recording") not in (None, False, 0, "no", "off"):
                 self._err("RECORDING_CONFLICT")
             now = self.clock()
@@ -512,6 +533,7 @@ class CaptureController:
                 "startedAtUs": now,
                 "endedAtUs": now + self.limits["maxDurationSeconds"] * 1000000,
             }
+            epoch["captureMode"] = "subscription-v1" if self.producer is not None else "pcap-v1"
             if media_checkpoint is not None:
                 epoch["mediaCheckpoint"] = media_checkpoint
             pcap = self.pcaps / (v["manifestId"] + ".pcap")
@@ -533,14 +555,15 @@ class CaptureController:
                     ),
                 )
             try:
-                reply = self.ng.request(
-                    {
-                        "command": "start recording",
-                        "call-id": sip,
-                        "recording-file": str(pcap),
-                        "metadata": "bitcall-recording:" + v["manifestId"],
-                    }
-                )
+                if self.producer is not None:
+                    row = self.db.execute("SELECT * FROM captures WHERE manifest_id=?", (v["manifestId"],)).fetchone()
+                    self.producer.start(dict(row), tags)
+                    reply = {"result": "ok"}
+                else:
+                    reply = self.ng.request(
+                        {"command": "start recording", "call-id": sip,
+                         "recording-file": str(pcap), "metadata": "bitcall-recording:" + v["manifestId"]}
+                    )
                 if not isinstance(reply, dict) or reply.get("result") != "ok":
                     raise CaptureError("RECORDING_UNAVAILABLE")
                 if self._media_checkpoint(v["callId"]) != media_checkpoint:
@@ -676,11 +699,52 @@ class CaptureController:
                 and q.get("error-reason") == "Unknown call-id"
             ):
                 self._err("RECORDING_CALL_NOT_COMPLETE")
+            native = False
+            native_stopped = False
+
+            def fail(code):
+                stop_native = native and not native_stopped
+                with self.db:
+                    self.db.execute(
+                        "UPDATE captures SET state='failed',error=?,stop_pending=CASE WHEN ? THEN 1 ELSE stop_pending END WHERE manifest_id=?",
+                        (code, int(stop_native), r["manifest_id"]),
+                    )
+                if stop_native:
+                    self._stop(
+                        self.db.execute(
+                            "SELECT * FROM captures WHERE manifest_id=?",
+                            (r["manifest_id"],),
+                        ).fetchone()
+                    )
+
             try:
-                p, metadata = self._files(r)
                 epoch = json.loads(r["epoch"])
-                if self.media_guard is not None and self._media_checkpoint(r["call_id"], require_closed=True) != epoch.get("mediaCheckpoint"):
-                    self._err("RECORDING_MEDIA_CHANGED", 409)
+                native = epoch.get("captureMode") == "subscription-v1"
+                if native:
+                    if self.producer is None:
+                        self._err("RECORDING_MEDIA_UNAVAILABLE")
+                    self.producer.health(dict(r))
+                    self.producer.finish(dict(r))
+                    native_stopped = True
+                p, metadata = self._files(r)
+                if self.media_guard is not None:
+                    closed = self._media_checkpoint(r["call_id"], require_closed=True)
+                    initial = epoch.get("mediaCheckpoint")
+                    if (
+                        not isinstance(initial, dict)
+                        or (not native and closed != initial)
+                        or (
+                            native
+                            and (
+                                closed["revision"] < initial["revision"]
+                                or (
+                                    closed["revision"] == initial["revision"]
+                                    and closed["digest"] != initial["digest"]
+                                )
+                            )
+                        )
+                    ):
+                        self._err("RECORDING_MEDIA_CHANGED", 409)
                 epoch["endedAtUs"] = ended
                 if (
                     not epoch["startedAtUs"]
@@ -701,6 +765,7 @@ class CaptureController:
                     json.loads(r["binding"]),
                     epoch,
                     self.limits,
+                    on_publish=lambda receipt: self._publish_receipt(r["manifest_id"], receipt),
                 )
                 with self.db:
                     self.db.execute(
@@ -708,22 +773,24 @@ class CaptureController:
                         (r["manifest_id"],),
                     )
             except CaptureError as e:
-                with self.db:
-                    self.db.execute(
-                        "UPDATE captures SET state='failed',error=? WHERE manifest_id=?",
-                        (e.code, r["manifest_id"]),
-                    )
+                fail(e.code)
             except Exception:
-                with self.db:
-                    self.db.execute(
-                        "UPDATE captures SET state='failed',error='RECORDING_FINALIZE_FAILED' WHERE manifest_id=?",
-                        (r["manifest_id"],),
-                    )
+                fail("RECORDING_FINALIZE_FAILED")
             return self._reply(
                 self.db.execute(
                     "SELECT * FROM captures WHERE manifest_id=?", (r["manifest_id"],)
                 ).fetchone()
             )
+
+    def _publish_receipt(self, manifest_id, receipt):
+        # Decoder has fsynced both private files; commit their identities before
+        # either becomes a final artifact so interrupted publication is provable.
+        raw = json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        with self.db:
+            row = self.db.execute("SELECT publication,state FROM captures WHERE manifest_id=?", (manifest_id,)).fetchone()
+            if not row or row["state"] != "finalizing" or (row["publication"] is not None and row["publication"] != raw):
+                self._err("RECORDING_CONFLICT")
+            self.db.execute("UPDATE captures SET publication=? WHERE manifest_id=?", (raw, manifest_id))
 
     def recover(self):
         with self.lock:
@@ -763,16 +830,23 @@ class CaptureController:
                 except OSError:
                     oversize = True
                 e = json.loads(r["epoch"])
+                producer_failed = False
+                if e.get("captureMode") == "subscription-v1":
+                    try:
+                        if self.producer is None: raise RuntimeError("producer unavailable")
+                        self.producer.health(dict(r))
+                    except Exception:
+                        producer_failed = True
                 if (
-                    now
+                    producer_failed or now
                     >= e["startedAtUs"] + self.limits["maxDurationSeconds"] * 1000000
                     or not self._available()
                     or oversize
                 ):
                     with self.db:
                         self.db.execute(
-                            "UPDATE captures SET state='failed',error='RECORDING_LIMIT_REACHED',stop_pending=1 WHERE manifest_id=?",
-                            (r["manifest_id"],),
+                            "UPDATE captures SET state='failed',error=?,stop_pending=1 WHERE manifest_id=?",
+                            ("RECORDING_MEDIA_UNAVAILABLE" if producer_failed else "RECORDING_LIMIT_REACHED", r["manifest_id"]),
                         )
                     self._stop(
                         self.db.execute(
