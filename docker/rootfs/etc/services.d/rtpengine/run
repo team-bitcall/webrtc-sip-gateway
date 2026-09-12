@@ -26,7 +26,11 @@ fi
 # 2223 is the NG UDP control socket used by Kamailio's rtpengine module.
 # 7722 is the CLI TCP control socket used by rtpengine-ctl.
 # Both sockets are bound to localhost and are not published externally.
-exec "$RTPENGINE_BIN" \
+set --
+if [ "${SEAT_MODE:-disabled}" = managed ] && [ "${SEAT_RECORDING_ENABLED:-0}" = 1 ]; then
+  set -- --recording-dir="${SEAT_RECORDING_SPOOL_DIR:?}" --recording-method=pcap --recording-format=eth
+fi
+exec "$RTPENGINE_BIN" "$@" \
   --foreground \
   --table=-1 \
   --interface="${PRIVATE_IP}!${PUBLIC_IP}" \

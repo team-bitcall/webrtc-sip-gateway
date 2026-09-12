@@ -1,0 +1,5 @@
+#!/command/with-contenv sh
+set -eu
+if [ "${SEAT_MODE:-disabled}" = managed ] && [ "${SEAT_RECORDING_ENABLED:-0}" = 1 ]; then
+  exec python3 /opt/bitcall/seat/recording_storage.py
+fi

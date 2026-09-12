@@ -5,6 +5,8 @@ Build healthcheck/media/Dockerfile with GATEWAY_IMAGE pointing at the candidate.
 No network access, published ports, customer calls, or production configuration.
 """
 import argparse
+import json
+import re
 from pathlib import Path
 import subprocess
 import uuid
@@ -42,8 +44,11 @@ def main():
                 with (args.artifacts / filename).open('xb') as output:
                     subprocess.run(['docker', 'exec', name, 'cat', '/tmp/artifacts/' + filename],
                                    stdout=output, check=True, timeout=10)
+            manifest_id = json.loads((args.artifacts / 'report.json').read_text())['capture']['manifestId']
+            if not isinstance(manifest_id, str) or not re.fullmatch(r'[a-f0-9]{32}', manifest_id):
+                raise ValueError('invalid synthetic capture manifest')
             for suffix in ('wav', 'json'):
-                filename = '7' * 32 + '.' + suffix
+                filename = manifest_id + '.' + suffix
                 with (args.artifacts / filename).open('xb') as output:
                     subprocess.run(['docker', 'exec', name, 'cat', '/tmp/finalized/' + filename],
                                    stdout=output, check=True, timeout=10)

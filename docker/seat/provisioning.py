@@ -22,6 +22,8 @@ from call_journal import CallJournal, JournalError
 from compile_snapshot import (ID_RE, MAX_BYTES, SnapshotError, USER_RE, _atomic_write, _dns,
                               _no_duplicate_keys, snapshot_entries, validate_snapshot)
 from media_control import MediaController, MediaError
+from recording_transport import forward_recording, RecordingTransportError
+from recording_capture import CaptureError
 
 
 class ControlError(Exception):
@@ -464,6 +466,28 @@ class ControlHandler(http.server.BaseHTTPRequestHandler):
         if path == "/v1/call-events/health" and self.command == "GET":
             if self.server.journal is None: raise ControlError(404, "NOT_FOUND")
             return self.server.journal.health()
+        match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/recordings", path)
+        if match:
+            directory = getattr(self.server, "recording_directory", None)
+            if directory is None:
+                raise ControlError(404, "NOT_FOUND")
+            if self.command != "POST" or query:
+                raise ControlError(405, "METHOD_NOT_ALLOWED")
+            lengths = self.headers.get_all("Content-Length", [])
+            if (self.headers.get("Transfer-Encoding") is not None
+                    or self.headers.get_content_type() != "application/json"
+                    or len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,5}", lengths[0])):
+                raise ControlError(400, "INVALID_RECORDING_REQUEST")
+            try:
+                length = int(lengths[0])
+                if not 2 <= length <= 7168:
+                    raise ValueError("invalid recording request length")
+                body = json.loads(self.rfile.read(length).decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+                return forward_recording(directory, match.group(1), body)
+            except (CaptureError, RecordingTransportError) as error:
+                raise ControlError(error.status, error.code) from error
+            except (ValueError, UnicodeError, RecursionError) as error:
+                raise ControlError(400, "INVALID_RECORDING_REQUEST") from error
         match = re.fullmatch(r"/v1/tenants/(t_[0-9a-f]{64})/media", path)
         if match:
             if self.server.media is None: raise ControlError(404, "NOT_FOUND")
@@ -642,6 +666,9 @@ def main():
                                 projection=store.status)
     server = http.server.HTTPServer((host, int(os.environ.get("SEAT_CONTROL_PORT", "8881"))), ControlHandler)
     server.store, server.journal, server.media, server.token = store, journal, media, token
+    server.recording_directory = directory if os.environ.get("SEAT_RECORDING_ENABLED") == "1" else None
+    if server.recording_directory is not None and journal is None:
+        raise ControlError(503, "RECORDING_CALL_EVENTS_REQUIRED")
     server.control_boot_id = str(uuid.uuid4())
     if tls_cert and tls_key:
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)

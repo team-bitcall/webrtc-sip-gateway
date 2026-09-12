@@ -1,5 +1,7 @@
 """Synthetic WebRTC/PCMU recording and receive-only fork proof, inside a sandbox."""
 import asyncio
+import hashlib
+import sqlite3
 from collections import defaultdict
 import json
 from pathlib import Path
@@ -22,7 +24,7 @@ from media_fixture import NgClient, PcmuPeer, parse_rtp, pcmu_decode_many, tone,
 from media_webrtc_peer import WebRtcPeer
 from call_journal import CallJournal
 from media_control import MediaController, MediaError
-from recording_capture import CaptureController
+from recording_transport import forward_recording
 
 def engine_resources():
     status = Path('/proc/1/status').read_text()
@@ -168,7 +170,7 @@ async def main():
     outage_listener = None
     control_process = None
     watchdog_process = None
-    capture_controller = None
+    capture_process = None
     with NgClient() as ng, PcmuPeer(ssrc=0xB002) as provider, PcmuPeer(ssrc=0xCC03) as distractor, PcmuPeer(ssrc=0xDD04) as other_end:
         state = Path('/tmp/seat-state')
         state.mkdir(mode=0o700)
@@ -184,7 +186,7 @@ async def main():
         journal = CallJournal(state, clock=lambda: media_clock[0])
         controller = MediaController(state, journal, rpc, clock=lambda: media_clock[0],
                                      projection=lambda _tenant: {"status": "applied", "validUntil": int(time.time()) + 60})
-        tenant, seat = "t_" + "a" * 64, "s_" + "b" * 64
+        tenant, seat = "t_" + hashlib.sha256(b"fixture-customer").hexdigest(), "s_" + "b" * 64
         actor, listener_id = "c" * 32, "d" * 32
         try:
             for _ in range(30):
@@ -223,18 +225,36 @@ async def main():
             finalized.mkdir(mode=0o700)
             for private_path in (RECORDINGS, RECORDINGS / 'pcaps', RECORDINGS / 'metadata', RECORDINGS / 'tmp'):
                 private_path.chmod(0o700)
-            capture_controller = CaptureController(state, journal, rpc,
-                projection=lambda _tenant: {"status": "applied", "validUntil": int(time.time()) + 120},
-                ng=controller.ng, spool=RECORDINGS, output=finalized,
-                limits={"maxInputBytes": 8 * 1024 * 1024, "maxOutputBytes": 8 * 1024 * 1024,
-                        "maxDurationSeconds": 60, "maxPackets": 10000})
-            capture_manifest_id = '7' * 32
-            capture_binding = {"tenantId": "fixture-customer", "gatewayId": "https://gateway.fixture.invalid",
-                               "callId": cdr_id, "publicCallId": '6' * 32, "membershipId": "fixture-member"}
+            gateway_id = 'https://gateway.fixture.invalid'
+            def scoped_id(values):
+                return hashlib.sha256(json.dumps(values, separators=(',', ':')).encode()).hexdigest()[:32]
+            capture_manifest_id = scoped_id(['recording-v1', gateway_id, 'fixture-customer', cdr_id])
+            capture_binding = {"tenantId": "fixture-customer", "gatewayId": gateway_id,
+                               "callId": cdr_id, "publicCallId": scoped_id([gateway_id, 'fixture-customer', cdr_id]),
+                               "membershipId": "fixture-member"}
             (ARTIFACTS / 'capture-binding.json').write_text(json.dumps(capture_binding))
-            capture_start = capture_controller.handle(tenant, {"action": "start", "callId": cdr_id,
-                "manifestId": capture_manifest_id, "binding": capture_binding})
+            projection_path = state / 'state.sqlite3'
+            with sqlite3.connect(projection_path) as projection_db:
+                projection_db.execute('CREATE TABLE tenants(tenant TEXT PRIMARY KEY, revision INTEGER, digest TEXT, valid_until INTEGER)')
+                projection_db.execute('INSERT INTO tenants VALUES(?,?,?,?)', (tenant, 1, 'a' * 64, int(time.time()) + 120))
+            projection_path.chmod(0o600)
+            capture_rpc = {'active': [cdr_id], 'tenant': tenant, 'revision': 1, 'digest': 'a' * 64}
+            (ARTIFACTS / 'capture-rpc.json').write_text(json.dumps(capture_rpc))
+            capture_env = {**os.environ, 'SEAT_MODE': 'managed', 'SEAT_RECORDING_ENABLED': '1',
+                'SEAT_CALL_EVENTS': '1', 'SEAT_STATE_DIR': str(state),
+                'SEAT_RECORDING_SPOOL_DIR': str(RECORDINGS), 'SEAT_RECORDING_OUTPUT_DIR': str(finalized),
+                'SEAT_RECORDING_GATEWAY_ID': gateway_id}
+            capture_process = subprocess.Popen([sys.executable, str(Path(__file__).with_name('recording_worker_fixture.py'))], env=capture_env)
+            await wait_for(lambda: (state / 'recording-capture.sock').exists() or capture_process.poll() is not None, 'capture worker startup')
+            assert capture_process.poll() is None, 'capture worker failed startup'
+            async def capture_command(command):
+                return await asyncio.to_thread(forward_recording, state, tenant,
+                    {'issuedAtMs': int(time.time() * 1000), 'command': command})
+            capture_start = await capture_command({"action": "start", "callId": cdr_id,
+                "manifestId": capture_manifest_id, "binding": capture_binding,
+                "admission": {"seatId": seat, "snapshotRevision": 1}})
             assert capture_start['state'] == 'capturing', capture_start
+            report['checks'].append('separate-capture-worker-private-transport-and-journal-binding')
             start = {'action': 'start', 'callId': cdr_id, 'listenerId': listener_id,
                      'actorId': actor, 'leaseSeconds': 15}
             try:
@@ -365,8 +385,10 @@ async def main():
             journal.append({'callId': cdr_id, 'type': 'ended', 'legId': 'provider',
                             'sipCode': 200, 'reason': None, 'endedBy': 'agent'})
             rpc.active.clear()
+            capture_rpc['active'] = []
+            (ARTIFACTS / 'capture-rpc.json').write_text(json.dumps(capture_rpc))
             ng.request({'command': 'delete', 'call-id': call, 'delete-delay': 0})
-            capture_finished = capture_controller.handle(tenant, {'action': 'finish', 'callId': cdr_id,
+            capture_finished = await capture_command({'action': 'finish', 'callId': cdr_id,
                                                                  'manifestId': capture_manifest_id})
             if capture_finished['state'] != 'ready':
                 # Synthetic fixture only: bounded diagnostics before cleanup.
@@ -395,7 +417,14 @@ async def main():
                 if process is not None and process.returncode is None:
                     process.kill()
                     await process.wait()
-            if capture_controller: capture_controller.close()
+            if capture_process:
+                capture_process.terminate()
+                try: capture_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    capture_process.kill(); capture_process.wait(timeout=2)
+                    raise AssertionError('capture worker failed bounded shutdown')
+                assert capture_process.returncode == 0, 'capture worker failed shutdown'
+                assert not (state / 'recording-capture.sock').exists(), 'capture socket cleanup failed'
             controller.close(); journal.close()
             for current in (call, other):
                 ng.request({'command': 'delete', 'call-id': current, 'delete-delay': 0}, allow_error=True)
