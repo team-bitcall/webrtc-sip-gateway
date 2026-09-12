@@ -34,11 +34,11 @@ async def until(predicate, label, seconds=8):
     raise AssertionError('Timed out: ' + label)
 
 
-async def feed(peer, destination, stopped, received):
+async def feed(peer, destination, stopped, received, frequency=660):
     peer.socket.setblocking(False)
     position = 0
     while not stopped.is_set():
-        peer.send_pcm(tone([660], phase=position), destination[0], pace=False)
+        peer.send_pcm(tone([frequency], phase=position), destination[0], pace=False)
         position += 160
         while True:
             try: raw = peer.socket.recv(65535)

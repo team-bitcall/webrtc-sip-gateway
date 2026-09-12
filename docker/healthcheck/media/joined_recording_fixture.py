@@ -45,6 +45,90 @@ def publish_ready(path, value):
         raise
 
 
+class PilotCall:
+    """Own one real media pair; per-call identities and tones expose cross-call mixing."""
+    def __init__(self, index, tenant, ng, journal, media, rpc):
+        self.ng, self.journal, self.media, self.rpc = ng, journal, media, rpc
+        self.tenant = tenant
+        self.call = 'joined-' + uuid.uuid4().hex
+        self.identity = {
+            'membershipId': f'joined-agent-{index}',
+            'seatId': 's_' + hashlib.sha256(f'joined-agent-{index}'.encode()).hexdigest(),
+            'destination': f'+120255501{index:02d}',
+            'effectiveCallerId': f'+120255502{index:02d}',
+            'frequency': 440 + 40 * index,
+            'providerFrequency': 660 + 40 * index,
+        }
+        self.browser = WebRtcPeer(outgoing=True, frequency=self.identity['frequency'])
+        self.provider = PcmuPeer(ssrc=0xB001 + index)
+        self.stopped = asyncio.Event()
+        self.task = None
+        self.closed = False
+
+    async def start(self):
+        source = await self.browser.offer()
+        offer = self.ng.request({'command': 'offer', 'call-id': self.call, 'from-tag': 'agent', 'sdp': source,
+            'replace': ['origin', 'session connection'], 'ICE': 'remove', 'DTLS': 'off',
+            'DTLS-reverse': 'passive', 'rtcp-mux': ['demux'], 'SDES': 'off', 'transport protocol': 'RTP/AVP'})
+        answer = self.ng.request({'command': 'answer', 'call-id': self.call, 'from-tag': 'agent', 'to-tag': 'provider',
+            'sdp': self.provider.sdp(), 'ICE': 'force', 'DTLS': 'passive', 'SDES': 'off',
+            'replace': ['origin', 'session connection'], 'transport protocol': 'RTP/SAVPF', 'rtcp-mux': ['offer']})
+        await self.browser.accept_answer(answer['sdp'])
+        received = []
+        self.task = asyncio.create_task(feed(self.provider, [address(offer['sdp'])], self.stopped, received,
+                                             self.identity['providerFrequency']))
+        await until(lambda: self.browser.connectionState == 'connected' and self.browser.audio_ready()
+                    and len(received) >= 15, 'bidirectional media')
+        assert 'DTLS fingerprint verified' in str(self.ng.request({'command': 'query', 'call-id': self.call}))
+        _, cdr = self.journal.admit({'tenantId': self.tenant, 'seatId': self.identity['seatId'], 'snapshotRevision': 1,
+            'sipCallId': self.call, 'fromTag': 'agent', 'legId': '', 'destination': self.identity['destination'],
+            'requestedCallerId': self.identity['effectiveCallerId'], 'effectiveCallerId': self.identity['effectiveCallerId']})
+        self.identity['callId'] = cdr
+        for revision, sdp in enumerate((source, self.provider.sdp()), 1):
+            self.media.begin({'callId': cdr, 'revision': revision, 'method': 'INVITE', 'fromTag': 'agent',
+                'toTag': '' if revision == 1 else 'provider', 'sipCode': 0 if revision == 1 else 200,
+                'sdpSha256': hashlib.sha256(sdp.encode()).hexdigest()})
+            self.media.complete({'callId': cdr, 'revision': revision, 'success': True})
+        self.journal.append({'callId': cdr, 'type': 'answered', 'legId': 'provider', 'sipCode': 200,
+            'reason': None, 'endedBy': None})
+        self.rpc.active.add(cdr)
+
+    async def close(self):
+        if self.closed:
+            return
+        self.stopped.set()
+        errors = []
+        if self.task:
+            try:
+                await self.task
+            except Exception as error:
+                errors.append(error)
+        try:
+            await self.browser.close()
+        except Exception as error:
+            errors.append(error)
+        try:
+            self.provider.close()
+        except Exception as error:
+            errors.append(error)
+        try:
+            self.ng.request({'command': 'delete', 'call-id': self.call, 'delete-delay': 0})
+        except Exception as error:
+            errors.append(error)
+        self.rpc.active.discard(self.identity.get('callId'))
+        self.closed = True
+        if errors:
+            raise RuntimeError('pilot media cleanup failed') from errors[0]
+
+    async def end(self):
+        await self.close()
+        cdr = self.identity['callId']
+        self.rpc.active.discard(cdr)
+        self.media.media_closure({'callId': cdr, 'count': 2, 'unsafe': False})
+        self.journal.append({'callId': cdr, 'type': 'ended', 'legId': 'provider', 'sipCode': 200,
+            'reason': None, 'endedBy': 'agent'})
+
+
 async def main():
     root = Path('/tmp/joined-recording')
     root.mkdir(mode=0o700)
@@ -52,9 +136,11 @@ async def main():
         (root / name).mkdir(mode=0o700)
     gateway = os.environ['BITCALL_PILOT_GATEWAY_ID']
     assert gateway.startswith('http://127.0.0.1:')
-    customer, member = 'joined-pilot', 'joined-agent'
-    tenant, seat = 't_' + hashlib.sha256(customer.encode()).hexdigest(), 's_' + 'b' * 64
-    ng, call = NgClient(), 'joined-' + uuid.uuid4().hex
+    count = int(os.environ.get('BITCALL_PILOT_CALLS', '5'))
+    assert 1 <= count <= 5
+    customer = 'joined-pilot'
+    tenant = 't_' + hashlib.sha256(customer.encode()).hexdigest()
+    ng = NgClient()
     journal = CallJournal(root / 'state')
     media = MediaJournal(journal)
     class Rpc:
@@ -77,59 +163,42 @@ async def main():
     server.token, server.recording_directory, server.journal = secrets.token_urlsafe(32), root / 'state', journal
     http_thread = threading.Thread(target=server.serve_forever, daemon=True)
     http_thread.start()
-    browser, stopped, task = WebRtcPeer(outgoing=True, frequency=440), asyncio.Event(), None
+    calls = [PilotCall(index, tenant, ng, journal, media, rpc) for index in range(count)]
     try:
-        with PcmuPeer(ssrc=0xB001) as provider:
-            source = await browser.offer()
-            offer = ng.request({'command': 'offer', 'call-id': call, 'from-tag': 'agent', 'sdp': source,
-                'replace': ['origin', 'session connection'], 'ICE': 'remove', 'DTLS': 'off',
-                'DTLS-reverse': 'passive', 'rtcp-mux': ['demux'], 'SDES': 'off', 'transport protocol': 'RTP/AVP'})
-            answer = ng.request({'command': 'answer', 'call-id': call, 'from-tag': 'agent', 'to-tag': 'provider',
-                'sdp': provider.sdp(), 'ICE': 'force', 'DTLS': 'passive', 'SDES': 'off',
-                'replace': ['origin', 'session connection'], 'transport protocol': 'RTP/SAVPF', 'rtcp-mux': ['offer']})
-            await browser.accept_answer(answer['sdp'])
-            received = []
-            task = asyncio.create_task(feed(provider, [address(offer['sdp'])], stopped, received))
-            await until(lambda: browser.connectionState == 'connected' and browser.audio_ready() and len(received) >= 15, 'bidirectional media')
-            assert 'DTLS fingerprint verified' in str(ng.request({'command': 'query', 'call-id': call}))
-            _, cdr = journal.admit({'tenantId': tenant, 'seatId': seat, 'snapshotRevision': 1,
-                'sipCallId': call, 'fromTag': 'agent', 'legId': '', 'destination': '+12025550100',
-                'requestedCallerId': None, 'effectiveCallerId': '+12025550101'})
-            for revision, sdp in enumerate((source, provider.sdp()), 1):
-                media.begin({'callId': cdr, 'revision': revision, 'method': 'INVITE', 'fromTag': 'agent',
-                    'toTag': '' if revision == 1 else 'provider', 'sipCode': 0 if revision == 1 else 200,
-                    'sdpSha256': hashlib.sha256(sdp.encode()).hexdigest()})
-                media.complete({'callId': cdr, 'revision': revision, 'success': True})
-            journal.append({'callId': cdr, 'type': 'answered', 'legId': 'provider', 'sipCode': 200, 'reason': None, 'endedBy': None})
-            rpc.active.add(cdr)
-            ready = {'baseUrl': gateway, 'token': server.token, 'tenantId': customer, 'projectedTenantId': tenant,
-                'membershipId': member, 'seatId': seat, 'callId': cdr}
-            publish_ready(root / 'ready.json', ready)
-            deadline = time.monotonic() + 90
-            while not (root / 'end-call').exists():
-                if time.monotonic() > deadline: raise TimeoutError('pilot did not end call')
-                controller.tick()
-                await asyncio.sleep(.05)
-            stopped.set(); await task; task = None
-            await browser.close()
-            ng.request({'command': 'delete', 'call-id': call, 'delete-delay': 0})
-            rpc.active.clear()
-            media.media_closure({'callId': cdr, 'count': 2, 'unsafe': False})
-            journal.append({'callId': cdr, 'type': 'ended', 'legId': 'provider', 'sipCode': 200, 'reason': None, 'endedBy': 'agent'})
-            (root / 'ended').touch()
-            deadline = time.monotonic() + 90
-            while not (root / 'done').exists():
-                if time.monotonic() > deadline: raise TimeoutError('pilot did not complete handoff')
-                controller.tick()
-                await asyncio.sleep(.05)
+        started = await asyncio.gather(*(call.start() for call in calls), return_exceptions=True)
+        for result in started:
+            if isinstance(result, BaseException):
+                raise result
+        ready = {'baseUrl': gateway, 'token': server.token, 'tenantId': customer, 'projectedTenantId': tenant,
+            **calls[0].identity, 'calls': [call.identity for call in calls]}
+        publish_ready(root / 'ready.json', ready)
+        deadline = time.monotonic() + 90
+        while not (root / 'end-call').exists():
+            if time.monotonic() > deadline: raise TimeoutError('pilot did not end calls')
+            controller.tick()
+            await asyncio.sleep(.05)
+        ended = await asyncio.gather(*(call.end() for call in calls), return_exceptions=True)
+        for result in ended:
+            if isinstance(result, BaseException):
+                raise result
+        (root / 'ended').touch()
+        deadline = time.monotonic() + 90
+        while not (root / 'done').exists():
+            if time.monotonic() > deadline: raise TimeoutError('pilot did not complete handoff')
+            controller.tick()
+            await asyncio.sleep(.05)
     finally:
-        stopped.set()
-        if task: await task
-        await browser.close()
-        server.shutdown(); server.server_close(); http_thread.join(timeout=2)
-        closing.set(); unix_thread.join(timeout=2); transport.close()
-        controller.close(); journal.close()
-        ng.request({'command': 'delete', 'call-id': call})
+        cleanup_results = await asyncio.gather(*(call.close() for call in calls), return_exceptions=True)
+        server.shutdown()
+        server.server_close()
+        http_thread.join(timeout=2)
+        closing.set()
+        unix_thread.join(timeout=2)
+        transport.close()
+        controller.close()
+        journal.close()
+        if any(isinstance(result, BaseException) for result in cleanup_results):
+            raise RuntimeError('pilot peer cleanup failed')
 
 
 if __name__ == '__main__': asyncio.run(main())
