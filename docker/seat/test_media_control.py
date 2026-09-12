@@ -4,6 +4,7 @@ import unittest
 
 from call_journal import CallJournal
 from media_control import MediaController, MediaError
+from media_watchdog import MediaWatchdog
 
 
 TENANT = "t_" + "a" * 64
@@ -161,6 +162,42 @@ class MediaControlTests(unittest.TestCase):
                                                  "listenerId": unknown, "actorId": ACTOR, **extra})
             self.assertEqual((error.exception.status, error.exception.code), (404, "MEDIA_NOT_FOUND"))
         self.assertEqual(self.ng.requests, before)
+
+    def test_watchdog_expires_a_subscription_after_controller_closes(self):
+        self.start()
+        self.controller.close()
+        self.now[0] += 15_001
+        guard = MediaWatchdog(self.temp.name, ng=self.ng, clock=lambda: self.now[0])
+        self.assertEqual(guard.sweep(), 1)
+        guard.close()
+        self.controller = MediaController(self.temp.name, self.journal, self.rpc,
+                                          clock=lambda: self.now[0], ng=self.ng,
+                                          projection=lambda _tenant: {"status": "applied", "validUntil": 999999})
+        self.assertEqual(self.controller._row(TENANT, LISTENER)["state"], "ended")
+
+    def test_watchdog_wins_late_answer_and_old_tag_cannot_hit_new_listener(self):
+        offered = self.start()
+        old = self.controller._row(TENANT, LISTENER)
+        self.now[0] += 15_001
+        guard = MediaWatchdog(self.temp.name, ng=self.ng, clock=lambda: self.now[0])
+        guard.sweep()
+        answer = "v=0\r\nm=audio 9 RTP/AVP 0\r\na=recvonly\r\nm=audio 9 RTP/AVP 0\r\na=recvonly\r\n"
+        before = sum(item["command"] == "subscribe answer" for item in self.ng.requests)
+        with self.assertRaises(MediaError):
+            self.request("answer", fence=offered["fence"], sdp=answer)
+        self.assertEqual(sum(item["command"] == "subscribe answer" for item in self.ng.requests), before)
+        newer = self.controller.handle(TENANT, {"action": "start", "callId": self.call_id,
+                                                 "listenerId": "e" * 32, "actorId": "f" * 32,
+                                                 "leaseSeconds": 15})
+        new_row = self.controller._row(TENANT, "e" * 32)
+        self.assertNotEqual(old["listener_tag"], new_row["listener_tag"])
+        guard.sweep()
+        self.assertTrue(any(item.get("command") == "unsubscribe" and item.get("to-tag") == old["listener_tag"]
+                            for item in self.ng.requests))
+        self.assertFalse(any(item.get("command") == "unsubscribe" and item.get("to-tag") == new_row["listener_tag"]
+                             for item in self.ng.requests))
+        self.assertEqual(newer["state"], "negotiating")
+        guard.close()
 
 
 if __name__ == "__main__":

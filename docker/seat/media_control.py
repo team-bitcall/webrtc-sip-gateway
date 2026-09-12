@@ -69,7 +69,11 @@ class NgClient:
 
 
 class MediaController:
-    """Durable lease state. A process crash cannot revoke an RTPengine fork itself."""
+    """Durable lease state with bounded listener tags per still-live source call.
+
+    RTPengine retains an unsubscribed participant until source call teardown;
+    the per-call bound prevents repeated monitor toggles exhausting that pool.
+    """
     def __init__(self, directory, journal, rpc, *, clock=lambda: int(time.time() * 1000), ng=None,
                  maximum=1, maximum_tenant=100, maximum_total=1000, projection=None):
         if journal is None or not 1 <= maximum <= 5:
@@ -145,8 +149,9 @@ class MediaController:
             and all(marker not in value for marker in ("a=sendonly", "a=sendrecv", "m=application ", "m=video "))
 
     @staticmethod
-    def _listener_tag(call_id, actor_id):
-        return hashlib.sha256((call_id + ":" + actor_id).encode("ascii")).hexdigest()
+    def _listener_tag(call_id, listener_id, fence):
+        """A new listener incarnation cannot share a cleanup target with an old one."""
+        return hashlib.sha256((call_id + ":" + listener_id + ":" + str(fence)).encode("ascii")).hexdigest()
 
     @staticmethod
     def _answer_hash(sdp):
@@ -248,6 +253,8 @@ class MediaController:
             active = self.db.execute("SELECT COUNT(*) AS value FROM sessions WHERE tenant_id=? AND call_id=? AND state IN " + active_states, (tenant, value["callId"])).fetchone()["value"]
             if active >= self.maximum:
                 raise MediaError("MEDIA_LIMIT", 409)
+            if self.db.execute("SELECT COUNT(*) AS value FROM sessions WHERE tenant_id=? AND call_id=?", (tenant, value["callId"])).fetchone()["value"] >= 64:
+                raise MediaError("MEDIA_LIMIT", 409)
             if self.db.execute("SELECT COUNT(*) AS value FROM sessions", ()).fetchone()["value"] >= self.maximum_total \
                     or self.db.execute("SELECT COUNT(*) AS value FROM sessions WHERE tenant_id=?", (tenant,)).fetchone()["value"] >= self.maximum_tenant:
                 raise MediaError("MEDIA_LIMIT", 409)
@@ -255,20 +262,30 @@ class MediaController:
             if actor:
                 raise MediaError("MEDIA_CONFLICT", 409)
             fence = secrets.randbelow(2**31 - 1) + 1
-            tag = self._listener_tag(value["callId"], value["actorId"])
+            tag = self._listener_tag(value["callId"], value["listenerId"], fence)
             self.db.execute("INSERT INTO sessions VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (tenant, value["callId"], value["listenerId"], value["actorId"], tag, sip_call_id, json.dumps(tags), "starting", fence, expires, None, None, now))
+        cleanup = False
         try:
             reply = self.ng.request({"command": "subscribe request", "call-id": sip_call_id,
                                      "from-tags": tags, "to-tag": tag, "flags": ["WebRTC"]})
             offer = reply.get("sdp")
             if reply.get("result") != "ok" or not self._offer_sdp(offer):
                 raise MediaError("MEDIA_UNAVAILABLE")
+            cleanup = False
             with self.lock, self.db:
-                self.db.execute("UPDATE sessions SET state='negotiating', offer_sdp=?, updated_at=? WHERE tenant_id=? AND listener_id=? AND state='starting'", (offer, self.clock(), tenant, value["listenerId"]))
-                row = self._row(tenant, value["listenerId"])
-                if row and row["state"] == "negotiating":
-                    return self._reply(row)
+                updated = self.db.execute("UPDATE sessions SET state='negotiating', offer_sdp=?, updated_at=? WHERE tenant_id=? AND listener_id=? AND state='starting' AND fence=? AND expires_at>?", (offer, self.clock(), tenant, value["listenerId"], fence, self.clock())).rowcount
+                if updated != 1:
+                    cleanup = True
+                else:
+                    row = self._row(tenant, value["listenerId"])
+                    if row and row["state"] == "negotiating":
+                        return self._reply(row)
+            if cleanup:
+                self._unsubscribe({"sip_call_id": sip_call_id, "listener_tag": tag})
+                raise MediaError("MEDIA_UNAVAILABLE")
         except (MediaError, OSError, sqlite3.Error):
+            if cleanup:
+                raise
             # A request may have reached RTPengine before a malformed reply or
             # local persistence error. Best-effort cleanup never affects source
             # legs and the durable row is removed only while still unexposed.
@@ -298,18 +315,27 @@ class MediaController:
             if not row: raise MediaError("MEDIA_FORBIDDEN", 403)
             self._check_owner(row, value)
             if row["fence"] != value["fence"]: raise MediaError("MEDIA_FORBIDDEN", 403)
+            if row["expires_at"] <= self.clock(): raise MediaError("MEDIA_CONFLICT", 409)
             if row["state"] == "listening":
                 if hmac.compare_digest(row["answer_hash"] or "", digest): return self._reply(row)
                 raise MediaError("MEDIA_CONFLICT", 409)
-            if row["state"] != "negotiating" or row["expires_at"] <= self.clock(): raise MediaError("MEDIA_CONFLICT", 409)
-            self.db.execute("UPDATE sessions SET state='answering', updated_at=? WHERE tenant_id=? AND listener_id=?", (self.clock(), tenant, value["listenerId"]))
+            if row["state"] != "negotiating": raise MediaError("MEDIA_CONFLICT", 409)
+            updated = self.db.execute("UPDATE sessions SET state='answering', updated_at=? WHERE tenant_id=? AND listener_id=? AND state='negotiating' AND fence=? AND expires_at>?", (self.clock(), tenant, value["listenerId"], value["fence"], self.clock())).rowcount
+            if updated != 1: raise MediaError("MEDIA_CONFLICT", 409)
         try:
             reply = self.ng.request({"command": "subscribe answer", "call-id": row["sip_call_id"],
                                      "to-tag": row["listener_tag"], "sdp": value["sdp"]})
             if reply.get("result") != "ok": raise MediaError("MEDIA_UNAVAILABLE")
+            cleanup = False
             with self.lock, self.db:
-                self.db.execute("UPDATE sessions SET state='listening', answer_hash=?, updated_at=? WHERE tenant_id=? AND listener_id=?", (digest, self.clock(), tenant, value["listenerId"]))
-                return self._reply(self._row(tenant, value["listenerId"]))
+                updated = self.db.execute("UPDATE sessions SET state='listening', answer_hash=?, updated_at=? WHERE tenant_id=? AND listener_id=? AND state='answering' AND fence=? AND expires_at>?", (digest, self.clock(), tenant, value["listenerId"], value["fence"], self.clock())).rowcount
+                if updated != 1:
+                    cleanup = True
+                else:
+                    return self._reply(self._row(tenant, value["listenerId"]))
+            if cleanup:
+                self._unsubscribe(row)
+                raise MediaError("MEDIA_UNAVAILABLE")
         except MediaError:
             with self.lock, self.db:
                 self.db.execute("UPDATE sessions SET state='negotiating', updated_at=? WHERE tenant_id=? AND listener_id=? AND state='answering'", (self.clock(), tenant, value["listenerId"]))

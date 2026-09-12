@@ -6,6 +6,7 @@ from pathlib import Path
 import re
 import os
 import socket
+import signal
 import struct
 import subprocess
 import sys
@@ -162,6 +163,9 @@ async def main():
     browser = WebRtcPeer(outgoing=True, max_samples=64000)
     listener = WebRtcPeer(max_samples=64000)
     expiry_listener = None
+    outage_listener = None
+    control_process = None
+    watchdog_process = None
     with NgClient() as ng, PcmuPeer(ssrc=0xB002) as provider, PcmuPeer(ssrc=0xCC03) as distractor, PcmuPeer(ssrc=0xDD04) as other_end:
         state = Path('/tmp/seat-state')
         state.mkdir(mode=0o700)
@@ -269,7 +273,7 @@ async def main():
             # The NG contract stops forwarding but retains the participant until
             # call teardown. Verify media stops, not an undocumented tag deletion.
             await wait_for_listener_stop(listener, browser, captured)
-            listener_tag = controller._listener_tag(cdr_id, actor)
+            listener_tag = controller._listener_tag(cdr_id, listener_id, requested['fence'])
             report['listenerRetainedAfterUnsubscribe'] = listener_tag in ng.request({'command': 'query', 'call-id': call})['tags']
             assert report['listenerRetainedAfterUnsubscribe']
             await listener.close()
@@ -284,6 +288,45 @@ async def main():
             await wait_for_listener_stop(expiry_listener, browser, captured)
             report['checks'].append('controller-tenant-journal-ng-lease-stop-and-expiry')
             await expiry_listener.close()
+            # A real stopped controller cannot execute its own expiry sweep.
+            # The independent process must silence only its listener.
+            controller.close()
+            control_process = await asyncio.create_subprocess_exec(
+                sys.executable, str(Path(__file__).with_name('controller_process.py')), str(state), cdr_id,
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE)
+
+            async def process_command(command):
+                control_process.stdin.write((json.dumps({'tenant': tenant, 'command': command}) + '\n').encode())
+                await control_process.stdin.drain()
+                line = await asyncio.wait_for(control_process.stdout.readline(), 5)
+                assert line, 'controller fixture exited'
+                return json.loads(line)
+
+            outage_listener = WebRtcPeer(max_samples=64000)
+            outage_start = {**start, 'listenerId': '9' * 32, 'actorId': '8' * 32}
+            outage_offer = await process_command(outage_start)
+            outage_answer = await outage_listener.answer_subscription(outage_offer['offerSdp'])
+            await process_command({**{key: value for key, value in outage_start.items() if key != 'leaseSeconds'},
+                                   'action': 'answer', 'fence': outage_offer['fence'], 'sdp': outage_answer})
+            await wait_for(lambda: outage_listener.audio_ready(track_count=2), 'outage listener tracks')
+            os.kill(control_process.pid, signal.SIGSTOP)
+            watchdog_process = await asyncio.create_subprocess_exec(
+                sys.executable, '/seat-proof/media_watchdog.py',
+                env={**os.environ, 'SEAT_MODE': 'managed', 'SEAT_MEDIA_ENABLED': '1',
+                     'SEAT_STATE_DIR': str(state)})
+            expiry_delay = max(0, (outage_offer['expiresAtMs'] - time.time() * 1000) / 1000)
+            await asyncio.sleep(expiry_delay + 1.2)
+            assert watchdog_process.returncode is None, 'watchdog exited during controller outage'
+            await wait_for_listener_stop(outage_listener, browser, captured)
+            report['checks'].append('independent-watchdog-stopped-controller-source-survives')
+            report['watchdogExpiryLagMs'] = round(time.time() * 1000 - outage_offer['expiresAtMs'])
+            await outage_listener.close()
+            os.kill(control_process.pid, signal.SIGKILL)
+            await control_process.wait()
+            control_process = None
+            watchdog_process.terminate()
+            await watchdog_process.wait()
+            watchdog_process = None
             before = len(captured)
             ng.request({'command': 'stop recording', 'call-id': call})
             await asyncio.sleep(.5)
@@ -303,6 +346,11 @@ async def main():
             await asyncio.gather(*tasks, return_exceptions=True)
             await browser.close(); await listener.close()
             if expiry_listener: await expiry_listener.close()
+            if outage_listener: await outage_listener.close()
+            for process in (control_process, watchdog_process):
+                if process is not None and process.returncode is None:
+                    process.kill()
+                    await process.wait()
             controller.close(); journal.close()
             for current in (call, other):
                 ng.request({'command': 'delete', 'call-id': current, 'delete-delay': 0}, allow_error=True)

@@ -1,0 +1,7 @@
+#!/command/with-contenv sh
+set -eu
+
+if [ "${SEAT_MODE:-disabled}" != managed ] || [ "${SEAT_MEDIA_ENABLED:-0}" != 1 ]; then
+  exec sleep infinity
+fi
+exec python3 /opt/bitcall/seat/media_watchdog.py
