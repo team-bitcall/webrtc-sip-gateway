@@ -47,3 +47,21 @@ These load the existing protected config and Mongo environment. They add no brow
 One worker, at most five captures, 100 stored jobs; bounded per-pass finalization, input packets/bytes, output bytes and duration. Unix reads have total deadlines, strict framing and mode-0600 socket ownership. SIGTERM closes handles/socket; a later restart marks interrupted captures unavailable and retries safe recording stop without deleting voice calls.
 
 Only stable IPv4 PCMU/PCMA 8 kHz, two source legs. Media changes/reorder/overlap remain unsupported and fail closed. Durable distributed file delivery, atomic upload acknowledgment/cleanup, authoritative SDP epochs, retention/quota behavior and broader capacity/codec acceptance remain open. Do not enable customers from this checkpoint.
+
+## Finalized artifact handoff
+
+The same private authenticated `POST /v1/tenants/{projectedTenantId}/recordings`
+route accepts three additional commands inside the existing timestamped envelope:
+
+- `list-ready`: `after` is a nonnegative SQLite cursor; `limit` is 1–25. Returns tenant-scoped ready artifacts and a pagination cursor.
+- `manifest`: requires `callId` and `manifestId`; returns the exact manifest bytes as Base64, parsed fields and SHA-256.
+- `chunk`: requires those IDs, pinned `manifestSha256`, nonnegative `offset` and `length` 1–65536. Returns Base64 bytes, offset, EOF, declared file size and WAV SHA-256.
+
+No client-supplied filesystem paths are accepted. Only private regular files bound
+to a ready capture may be read. Commands retain envelope age checks and tenant
+scoping. Unix requests remain capped at 8 KiB; replies are capped at 128 KiB.
+
+The backend separately validates attribution and hashes the complete WAV before
+queue admission. **These reads do not acknowledge durable storage and never delete
+gateway artifacts.** S3 acknowledgement and retention/reclamation remain explicit
+release gates; the bounded gateway spool can fill until that lifecycle exists.

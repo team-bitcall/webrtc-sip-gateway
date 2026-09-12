@@ -10,6 +10,7 @@ import stat
 import time
 
 MAX_FRAME_BYTES = 8192
+MAX_REPLY_BYTES = 131072
 SOCKET_NAME = "recording-capture.sock"
 SAFE_ERROR_CODE = re.compile(r"[A-Z][A-Z0-9_]{0,63}\Z")
 
@@ -58,7 +59,7 @@ def _private_socket(path):
     return info
 
 
-def _encode(value):
+def _encode(value, maximum=MAX_FRAME_BYTES):
     try:
         data = (
             json.dumps(
@@ -68,13 +69,13 @@ def _encode(value):
         )
     except (TypeError, ValueError) as error:
         raise RecordingTransportError("INVALID_RECORDING_REQUEST", 400) from error
-    if len(data) > MAX_FRAME_BYTES:
+    if len(data) > maximum:
         raise RecordingTransportError("INVALID_RECORDING_REQUEST", 400)
     return data
 
 
-def _decode(data):
-    if not data.endswith(b"\n") or len(data) > MAX_FRAME_BYTES:
+def _decode(data, maximum=MAX_FRAME_BYTES):
+    if not data.endswith(b"\n") or len(data) > maximum:
         raise RecordingTransportError("INVALID_RECORDING_REQUEST", 400)
     try:
 
@@ -129,12 +130,12 @@ def forward_recording(directory, tenant, request):
             client.settimeout(max(0.001, deadline - time.monotonic()))
             client.sendall(payload)
             reply = bytearray()
-            while len(reply) <= MAX_FRAME_BYTES:
+            while len(reply) <= MAX_REPLY_BYTES:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError("recording reply deadline exceeded")
                 client.settimeout(remaining)
-                chunk = client.recv(min(4096, MAX_FRAME_BYTES + 1 - len(reply)))
+                chunk = client.recv(min(4096, MAX_REPLY_BYTES + 1 - len(reply)))
                 if not chunk:
                     break
                 reply.extend(chunk)
@@ -142,7 +143,7 @@ def forward_recording(directory, tenant, request):
                     break
     except (OSError, TimeoutError) as error:
         raise RecordingTransportError() from error
-    value = _decode(bytes(reply))
+    value = _decode(bytes(reply), MAX_REPLY_BYTES)
     if set(value) == {"result"}:
         return value["result"]
     error = value.get("error")
@@ -272,7 +273,7 @@ class RecordingTransportServer:
                 response = _error_response(error)
             try:
                 try:
-                    encoded = _encode(response)
+                    encoded = _encode(response, MAX_REPLY_BYTES)
                 except RecordingTransportError:
                     encoded = _encode(_error_response(Exception()))
                 client.sendall(encoded)

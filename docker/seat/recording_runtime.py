@@ -163,6 +163,11 @@ def dispatch(controller, tenant, request, gateway_id, now_ms=None, validator=Non
     """Validate the forwarded envelope, then execute the existing capture command."""
     if not isinstance(request, dict):
         raise RecordingTransportError("INVALID_RECORDING_REQUEST", 400)
+    if isinstance(request.get("command"), dict) and request["command"].get("action") in {"list-ready", "manifest", "chunk"}:
+        from recording_binding import validate_recording_envelope
+        from recording_artifacts import RecordingArtifacts
+        command = validate_recording_envelope(tenant, request, int(time.time() * 1000) if now_ms is None else now_ms)
+        return RecordingArtifacts(controller).handle(tenant, command)
     if validator is None:
         from recording_binding import validate_capture_request
 

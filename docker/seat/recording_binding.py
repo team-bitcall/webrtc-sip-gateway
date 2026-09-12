@@ -62,8 +62,8 @@ def _digest_array(values):
     ).hexdigest()
 
 
-def validate_capture_request(controller, tenant, request, gateway_id, now_ms):
-    """Return a controller command only after binding/deadline verification."""
+def validate_recording_envelope(tenant, request, now_ms):
+    """Validate the private request deadline shared by capture and artifact reads."""
     if (
         not isinstance(tenant, str)
         or not TENANT.fullmatch(tenant)
@@ -73,6 +73,12 @@ def validate_capture_request(controller, tenant, request, gateway_id, now_ms):
     issued = request["issuedAtMs"]
     if type(issued) is not int or not now_ms - 30_000 <= issued <= now_ms + 5_000:
         raise CaptureError("RECORDING_REQUEST_EXPIRED", 409)
+    return request["command"]
+
+
+def validate_capture_request(controller, tenant, request, gateway_id, now_ms):
+    """Return a controller command only after binding/deadline verification."""
+    validate_recording_envelope(tenant, request, now_ms)
     command = request["command"]
     if not isinstance(command, dict) or command.get("action") not in {
         "start",
