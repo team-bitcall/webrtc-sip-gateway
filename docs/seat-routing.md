@@ -31,6 +31,8 @@ The strict JSON schema is enforced by `docker/seat/compile_snapshot.py`:
   `validUntil`, canonical lowercase `domain`, `profiles`, `seats`.
 - Profiles: `id`, `tenantId`, `enabled`, `username`, explicit digest `realm`,
   `requestDomain`, `outboundProxy`, `credential: {kind, value}`, `fromUser`.
+  Optional `callerIdFormat` is `custom` (default) or `headers`; unknown values
+  are rejected. This changes provider presentation, not seat caller-ID policy.
   Credential kind is `password` or MD5 `ha1`. The current supported realm syntax
   is a lowercase DNS name, matching the proven provider contract.
 - Seats: `id`, `tenantId`, globally unique `username` within the realm,

@@ -216,6 +216,11 @@ assert set(calls) == set(expected_cdr_calls), (set(calls), set(expected_cdr_call
 assert not (set(calls) & rejected_cdr_calls), (set(calls), rejected_cdr_calls)
 for sip_call_id, expected in expected_cdr_calls.items():
     events = calls[sip_call_id]
+    if "expected_effective_caller_ids" in globals() and sip_call_id in expected_effective_caller_ids:
+        assert all(event["effectiveCallerId"] == expected_effective_caller_ids[sip_call_id]
+                   for event in events), events
+    if "expected_event_seat_ids" in globals() and sip_call_id in expected_event_seat_ids:
+        assert all(event["seatId"] == expected_event_seat_ids[sip_call_id] for event in events), events
     actual = [(event["type"], event["sipCode"], event["reason"], event["endedBy"])
               for event in events]
     assert actual[0] == expected[0], (sip_call_id, actual, expected)

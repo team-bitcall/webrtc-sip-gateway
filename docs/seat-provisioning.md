@@ -47,6 +47,22 @@ identity and send one `X-Bitcall-Caller-ID` hint. The gateway strips client iden
 headers and generates trusted P-Asserted-Identity and Remote-Party-ID from the
 effective policy identity.
 
+A profile may set `callerIdFormat: "headers"` to keep its account `fromUser`
+in upstream From while sending the approved caller ID in PAI, RPID and PPI.
+Omitted or `"custom"` uses the caller ID in From and PAI/RPID. Both add
+`Privacy: none`. Digest username is independent of `fromUser`; the selected
+format and caller ID remain frozen for the existing dialog. An absent caller-ID
+policy still uses the profile From without creating caller-ID headers.
+
+This is a direct format selection, not an automatic serial retry. Same-provider
+retry with unchanged Call-ID/From-tag/CSeq can trigger SIP merged-request rejection;
+no unverified CSeq manipulation is used. Legacy transparent routing is unchanged.
+Upgrade the gateway before sending this optional field from the backend. The
+webphone setting is trusted `tenant.seatRouting.callerIdFormat`; omission preserves
+the older snapshot shape. Check the applied snapshot revision after changing it.
+The saved `smoke_caller_id_formats.py` scenario covers both wire formats, upstream
+authentication, dialog continuity, CDR identity and terminal rejection in CI.
+
 Successful response:
 
 ```json

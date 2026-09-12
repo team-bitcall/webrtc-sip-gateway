@@ -76,6 +76,9 @@ jobs:
       - name: Caller identity stays fixed across existing call dialogs
         run: python3 docker/healthcheck/seat_dialog_fixture.py --image webrtc-sip-gateway:ci --caller-id
 
+      - name: Provider caller-ID formats preserve authentication and call history
+        run: python3 docker/healthcheck/smoke_caller_id_formats.py --image webrtc-sip-gateway:ci
+
       - name: Legacy registration with local seats and no control backend
         run: python3 docker/healthcheck/smoke_register_query.py --image webrtc-sip-gateway:ci --seat-mode
 

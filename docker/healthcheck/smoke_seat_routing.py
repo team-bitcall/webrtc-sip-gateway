@@ -372,9 +372,10 @@ def main():
     parser.add_argument("--call-events", action="store_true", help="assert managed call-event journaling through the private control API")
     parser.add_argument("--presence", action="store_true", help="assert private live registration and dialog observation")
     parser.add_argument("--events-output", type=Path, help="save synthetic exported events for backend contract validation")
+    parser.add_argument("--scenario", choices=("default", "caller-id-formats"), default="default")
     args = parser.parse_args()
     root = args.gateway_root.resolve()
-    if args.managed and args.source_overlay:
+    if args.managed and args.source_overlay and args.scenario != "caller-id-formats":
         parser.error("managed mode validates the packaged image only")
     if args.call_events and not args.managed:
         parser.error("call events require --managed")
@@ -382,7 +383,9 @@ def main():
         parser.error("presence requires --managed --call-events")
     if args.events_output and not args.call_events:
         parser.error("events output requires --call-events")
-    files = {"config": root / "docker/kamailio/kamailio.cfg", "seat config": root / "docker/kamailio/seat-routing.cfg", "renderer": root / "docker/rootfs/etc/cont-init.d/07-render-kamailio-cfg", "compiler": root / "docker/seat/compile_snapshot.py"}
+    if args.scenario == "caller-id-formats" and not (args.managed and args.call_events):
+        parser.error("caller-id-formats requires --managed --call-events")
+    files = {"config": root / "docker/kamailio/kamailio.cfg", "seat config": root / "docker/kamailio/seat-routing.cfg", "call events": root / "docker/kamailio/call-events.cfg", "recording media": root / "docker/kamailio/recording-media.cfg", "renderer": root / "docker/rootfs/etc/cont-init.d/07-render-kamailio-cfg", "compiler": root / "docker/seat/compile_snapshot.py"}
     if args.source_overlay and any(not path.is_file() for path in files.values()):
         parser.error("source overlay is incomplete")
     name = "bitcall-seat-routing-" + uuid.uuid4().hex[:12]
@@ -390,6 +393,13 @@ def main():
     with tempfile.TemporaryDirectory(prefix="bitcall-seat-routing-") as temp:
         temp = Path(temp); cert, key, state = temp / "cert.pem", temp / "key.pem", temp / "seats.json"
         fixture = snapshot(caller_ids=True)
+        if args.scenario == "caller-id-formats":
+            # Keep SIP authentication identity distinct from the provider's
+            # account From so the format fixture cannot conflate the two.
+            fixture["profiles"][0]["fromUser"] = "account-from-a"
+            fixture["profiles"][0]["callerIdFormat"] = "custom"
+            fixture["profiles"][1]["fromUser"] = "account-from-b"
+            fixture["profiles"][1]["callerIdFormat"] = "headers"
         if args.call_events:
             # Managed webphone snapshots use projected identifiers. Keep the
             # standalone gateway fixtures' existing generic IDs unchanged.
@@ -407,7 +417,7 @@ def main():
             renderer_copy.chmod(0o755)
         mounts = []
         if args.source_overlay:
-            mounts = ["-v", f"{files['config']}:/etc/kamailio/kamailio.cfg:ro", "-v", f"{files['seat config']}:/opt/bitcall/seat-routing.cfg:ro", "-v", f"{renderer_copy}:/etc/cont-init.d/07-render-kamailio-cfg:ro", "-v", f"{files['compiler']}:/opt/bitcall/compile_seat_snapshot.py:ro"]
+            mounts = ["-v", f"{files['config']}:/etc/kamailio/kamailio.cfg:ro", "-v", f"{files['seat config']}:/opt/bitcall/seat-routing.cfg:ro", "-v", f"{files['call events']}:/opt/bitcall/call-events.cfg:ro", "-v", f"{files['recording media']}:/opt/bitcall/recording-media.cfg:ro", "-v", f"{renderer_copy}:/etc/cont-init.d/07-render-kamailio-cfg:ro", "-v", f"{files['compiler']}:/opt/bitcall/compile_seat_snapshot.py:ro", "-v", f"{files['compiler']}:/opt/bitcall/seat/compile_snapshot.py:ro"]
         mode = "managed" if args.managed else "local"
         control_env = ["-e", "SEAT_CONTROL_TOKEN=" + "a" * 43, "-e", "SEAT_STATE_DIR=/var/lib/bitcall-seat", "--mount", f"type=volume,source={name}-state,target=/var/lib/bitcall-seat"] if args.managed else []
         if args.call_events:
@@ -427,13 +437,20 @@ def main():
                 except subprocess.CalledProcessError:
                     if time.monotonic() >= deadline: raise RuntimeError("gateway did not become ready")
                     time.sleep(.5)
-            scenario = IN_CONTAINER_TEST
+            if args.scenario == "caller-id-formats":
+                from smoke_caller_id_formats import IN_CONTAINER_SCENARIO
+                scenario = IN_CONTAINER_TEST.split("def carrier():", 1)[0] + IN_CONTAINER_SCENARIO
+            else:
+                scenario = IN_CONTAINER_TEST
             if args.managed:
                 from managed_seat_scenario import BEFORE_CALLS, AFTER_CALLS
                 scenario = BEFORE_CALLS + scenario
                 if args.call_events:
-                    from managed_seat_scenario import CALL_EVENTS, CALL_EVENT_FAILURES
-                    scenario += CALL_EVENT_FAILURES + AFTER_CALLS + CALL_EVENTS
+                    from managed_seat_scenario import CALL_EVENTS
+                    if args.scenario == "default":
+                        from managed_seat_scenario import CALL_EVENT_FAILURES
+                        scenario += CALL_EVENT_FAILURES + AFTER_CALLS
+                    scenario += CALL_EVENTS
                 else:
                     scenario += AFTER_CALLS
             print(run("docker", "exec", "-i", name, "python3", "-", input=scenario, timeout=45).strip())

@@ -124,9 +124,10 @@ def validate_snapshot(data, now=None):
     profiles, profile_ids = [], set()
     for index, item in enumerate(profiles_in):
         path = "profiles[%d]" % index
-        _keys(
+        _optional_keys(
             item,
             ("id", "tenantId", "enabled", "username", "realm", "requestDomain", "outboundProxy", "credential", "fromUser"),
+            ("callerIdFormat",),
             path,
         )
         profile_id = _string(item["id"], path + ".id", pattern=ID_RE)
@@ -146,6 +147,9 @@ def validate_snapshot(data, now=None):
         credential_value = _string(credential["value"], path + ".credential.value", 4096)
         if kind == "ha1" and not HA1_RE.fullmatch(credential_value):
             _fail(path + ".credential.value")
+        caller_id_format = item.get("callerIdFormat", "custom")
+        if not isinstance(caller_id_format, str) or caller_id_format not in ("custom", "headers"):
+            _fail(path + ".callerIdFormat")
         profiles.append(
             {
                 "id": profile_id,
@@ -160,6 +164,7 @@ def validate_snapshot(data, now=None):
                     "value": credential_value.lower() if kind == "ha1" else credential_value,
                 },
                 "fromUser": _string(item["fromUser"], path + ".fromUser", pattern=USER_RE),
+                "callerIdFormat": caller_id_format,
             }
         )
 
@@ -293,6 +298,7 @@ def snapshot_entries(normalized, tenant_id):
             ("credential_kind", profile["credential"]["kind"]),
             ("credential", profile["credential"]["value"]),
             ("from_user", profile["fromUser"]),
+            ("caller_id_format", profile["callerIdFormat"]),
         )
         for field, value in fields:
             entries.append(("seat_profiles", profile_prefix + field, value))

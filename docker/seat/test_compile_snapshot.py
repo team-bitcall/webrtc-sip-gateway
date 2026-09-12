@@ -92,6 +92,19 @@ class SnapshotValidationTests(unittest.TestCase):
         with self.assertRaises(SnapshotError):
             validate_snapshot(data, NOW)
 
+    def test_optional_profile_caller_id_format_defaults_and_is_strict(self):
+        normalized = validate_snapshot(snapshot(), NOW)
+        self.assertEqual(normalized["profiles"][0]["callerIdFormat"], "custom")
+        self.assertIn("caller_id_format", render_snapshot(normalized))
+        data = snapshot()
+        data["profiles"][0]["callerIdFormat"] = "headers"
+        self.assertEqual(validate_snapshot(data, NOW)["profiles"][0]["callerIdFormat"], "headers")
+        for value in ("strict", "", None, True, 1):
+            data = snapshot()
+            data["profiles"][0]["callerIdFormat"] = value
+            with self.assertRaises(SnapshotError):
+                validate_snapshot(data, NOW)
+
     def test_optional_caller_id_policy_is_strict_and_preserves_absent_behavior(self):
         self.assertNotIn("callerIdPolicy", validate_snapshot(snapshot(), NOW)["seats"][0])
         data = snapshot()
