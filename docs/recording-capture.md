@@ -20,7 +20,7 @@ The backend derives internal tenant, member, public CDR ID, historical seat and 
 
 Requests older than 30 seconds or more than 5 seconds ahead are rejected. Within that window, replay is handled by durable immutable call/manifest identity: retrying the same intent cannot start a second capture or rebind it. This reuses transport authentication; it adds no custom signing scheme. Keep clocks synchronized.
 
-Responses contain `callId`, `manifestId`, `state`, and an optional safe `errorCode`. States: `starting`, `capturing`, `finalizing`, `ready`, `failed`. **`ready` means private local WAV/manifest complete, not uploaded or billed storage.** The route returns 404 when disabled, 401 for bad authentication, 403 for browser-origin requests, 400 for malformed input, 409 for binding/deadline conflicts and 503 for worker/unavailable evidence.
+Responses contain `callId`, `manifestId`, `state`, and an optional safe `errorCode`. States: `starting`, `capturing`, `finalizing`, `ready`, `stored`, `failed`. **`ready` means private local WAV/manifest complete, not uploaded or billed storage.** The route returns 404 when disabled, 401 for bad authentication, 403 for browser-origin requests, 400 for malformed input, 409 for binding/deadline conflicts and 503 for worker/unavailable evidence.
 
 ## Explicit configuration
 
@@ -30,7 +30,7 @@ Responses contain `callId`, `manifestId`, `state`, and an optional safe `errorCo
 - `SEAT_RECORDING_SPOOL_DIR`: existing canonical owned 0700 directory on a filesystem with total capacity at most **128 MiB** for this pilot. The initializer creates private `pcaps`, `metadata`, `tmp` subdirectories. A directory on a large disk is not a hard bound and is rejected.
 - `SEAT_RECORDING_OUTPUT_DIR`: separate existing canonical owned 0700 directory; it cannot overlap/nest with raw spool.
 
-The initializer validates storage before RTPengine receives its recording flags. The worker retries startup through s6 if journal/projection initialization is not yet ready. Files remain 0600. No automated retention/deletion or producer-to-backend delivery is configured here. Use dedicated durable volumes for an actual pilot; the media fixture uses tmpfs and does not prove durability.
+The initializer validates storage before RTPengine receives its recording flags. The worker retries startup through s6 if journal/projection initialization is not yet ready. Files remain 0600. The opt-in backend handoff worker delivers finalized artifacts and acknowledges verified S3 storage; the gateway then reclaims only those acknowledged files. Failed-capture disposal and tombstone retention remain separate policy gates. Use dedicated durable volumes for an actual pilot; the media fixture uses tmpfs and does not prove durability.
 
 The backend additionally requires `teamRecordingCapture: {"enabled": true}` in its existing protected team-auth config, enabled gateway provisioning/call events, configured seat routing, an eligible customer tenant, recording entitlement, and a currently answered complete-enough CDR. It exposes an internal service and an explicit operator command:
 
@@ -46,7 +46,7 @@ These load the existing protected config and Mongo environment. They add no brow
 
 One worker, at most five captures, 100 stored jobs; bounded per-pass finalization, input packets/bytes, output bytes and duration. Unix reads have total deadlines, strict framing and mode-0600 socket ownership. SIGTERM closes handles/socket; a later restart marks interrupted captures unavailable and retries safe recording stop without deleting voice calls.
 
-Only stable IPv4 PCMU/PCMA 8 kHz, two source legs. Media changes/reorder/overlap remain unsupported and fail closed. Durable distributed file delivery, atomic upload acknowledgment/cleanup, authoritative SDP epochs, retention/quota behavior and broader capacity/codec acceptance remain open. Do not enable customers from this checkpoint.
+Only stable IPv4 PCMU/PCMA 8 kHz, two source legs. Media changes/reorder/overlap remain unsupported and fail closed. Authoritative SDP epochs, replay-tombstone/failed-capture retention, storage-full behavior and broader capacity/codec acceptance remain open. Do not enable customers from this checkpoint.
 
 ## Finalized artifact handoff
 
@@ -62,6 +62,26 @@ to a ready capture may be read. Commands retain envelope age checks and tenant
 scoping. Unix requests remain capped at 8 KiB; replies are capped at 128 KiB.
 
 The backend separately validates attribution and hashes the complete WAV before
-queue admission. **These reads do not acknowledge durable storage and never delete
-gateway artifacts.** S3 acknowledgement and retention/reclamation remain explicit
-release gates; the bounded gateway spool can fill until that lifecycle exists.
+queue admission. Reads alone do not acknowledge storage or delete files.
+
+## Verified acknowledgement and cleanup
+
+`acknowledge` requires `callId`, `manifestId`, `manifestSha256`, `sha256` (WAV), and
+`sizeBytes`. The backend sends it only after freshly verifying the uploaded object
+for a scoped ready recording. No arbitrary filenames or deletion commands exist.
+The gateway matches the receipt against its ready manifest, commits an immutable
+SQLite receipt and exact private file inventory, then removes only that intent's
+WAV, manifest, PCAP and uniquely validated closed metadata. Directory fsync precedes
+`stored`. An incomplete cleanup responds `cleanup_pending`; identical acknowledgement
+retries work even after some files are missing. Different receipts reject.
+
+At most five pending cleanups are retried per tick with a persisted rotating cursor.
+A replaced file or failed unlink/fsync preserves the pending receipt for recovery.
+`stored` tombstones prevent duplicate capture on replay; they still count toward the
+100-job limit. Tombstone compaction and failed-capture disposal are **not** implemented.
+A successful cleanup therefore reclaims audio bytes, not unlimited recording capacity.
+
+The spool is temporary but required for the current PCAP/finalization pipeline.
+Long-term audio lives in S3. Files remain until the trusted backend confirms verified
+storage; gateway state and receipts must survive restart. S3 lifecycle policy must
+preserve objects for the promised customer retention period.

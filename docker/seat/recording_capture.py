@@ -151,7 +151,7 @@ class CaptureController:
             self.db.execute("PRAGMA journal_mode=WAL")
             self.db.execute("PRAGMA synchronous=FULL")
             self.db.execute(
-                """CREATE TABLE IF NOT EXISTS captures(call_id TEXT UNIQUE NOT NULL,manifest_id TEXT UNIQUE NOT NULL,tenant_id TEXT NOT NULL,binding TEXT NOT NULL,sip_call_id TEXT,epoch TEXT,pcap TEXT,state TEXT NOT NULL,started_us INTEGER NOT NULL,ended_us INTEGER,error TEXT,stop_pending INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(manifest_id))"""
+                """CREATE TABLE IF NOT EXISTS captures(call_id TEXT UNIQUE NOT NULL,manifest_id TEXT UNIQUE NOT NULL,tenant_id TEXT NOT NULL,binding TEXT NOT NULL,sip_call_id TEXT,epoch TEXT,pcap TEXT,metadata TEXT,state TEXT NOT NULL,started_us INTEGER NOT NULL,ended_us INTEGER,error TEXT,stop_pending INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(manifest_id))"""
             )
             if "stop_pending" not in {
                 x[1] for x in self.db.execute("PRAGMA table_info(captures)")
@@ -160,6 +160,19 @@ class CaptureController:
                     self.db.execute(
                         "ALTER TABLE captures ADD COLUMN stop_pending INTEGER NOT NULL DEFAULT 0"
                     )
+            if "metadata" not in {x[1] for x in self.db.execute("PRAGMA table_info(captures)")}:
+                with self.db:
+                    self.db.execute("ALTER TABLE captures ADD COLUMN metadata TEXT")
+            self.db.execute(
+                """CREATE TABLE IF NOT EXISTS recording_cleanup(manifest_id TEXT PRIMARY KEY NOT NULL,tenant_id TEXT NOT NULL,call_id TEXT NOT NULL,manifest_sha256 TEXT NOT NULL,wav_sha256 TEXT NOT NULL,size_bytes INTEGER NOT NULL,inventory TEXT NOT NULL,state TEXT NOT NULL CHECK(state IN ('pending','stored')))"""
+            )
+            self.db.execute(
+                "CREATE TABLE IF NOT EXISTS recording_cleanup_cursor(id INTEGER PRIMARY KEY CHECK(id=1),cursor INTEGER NOT NULL)"
+            )
+            self.db.execute("INSERT OR IGNORE INTO recording_cleanup_cursor(id,cursor) VALUES(1,0)")
+            # Publish schema migrations and the retry cursor before the runtime
+            # can accept a private transport request.
+            self.db.commit()
             self.recovered = False
         except Exception:
             self._release()
@@ -572,14 +585,14 @@ class CaptureController:
             except (CaptureError, UnicodeError):
                 continue
             if marker in lines:
-                matches.append((raw, lines))
+                matches.append((Path(entry.path), raw, lines))
         if len(matches) != 1:
             self._err(
                 "RECORDING_METADATA_MISSING"
                 if not matches
                 else "RECORDING_METADATA_INVALID"
             )
-        raw, lines = matches[0]
+        path, raw, lines = matches[0]
         if (
             not raw.endswith(b"\n")
             or not lines
@@ -588,6 +601,7 @@ class CaptureController:
             or any(x.startswith("SDP mode:") for x in lines)
         ):
             self._err("RECORDING_METADATA_INVALID")
+        return path
 
     def _files(self, r):
         try:
@@ -606,8 +620,7 @@ class CaptureController:
                 raise OSError()
             os.fchmod(f, 0o600)
             os.close(f)
-            self._metadata_file(r, p)
-            return p
+            return p, self._metadata_file(r, p)
         except CaptureError:
             raise
         except Exception as e:
@@ -625,7 +638,7 @@ class CaptureController:
             ).fetchone()
             if not r:
                 self._err("RECORDING_NOT_FOUND", 404)
-            if r["state"] in {"ready", "failed"}:
+            if r["state"] in {"ready", "stored", "failed"}:
                 return self._reply(r)
             ended = self._ended(r["call_id"])
             try:
@@ -640,7 +653,7 @@ class CaptureController:
             ):
                 self._err("RECORDING_CALL_NOT_COMPLETE")
             try:
-                p = self._files(r)
+                p, metadata = self._files(r)
                 epoch = json.loads(r["epoch"])
                 epoch["endedAtUs"] = ended
                 if (
@@ -652,8 +665,8 @@ class CaptureController:
                     self._err("RECORDING_CAPTURE_INVALID")
                 with self.db:
                     self.db.execute(
-                        "UPDATE captures SET state='finalizing',ended_us=?,epoch=? WHERE manifest_id=?",
-                        (ended, json.dumps(epoch), r["manifest_id"]),
+                        "UPDATE captures SET state='finalizing',ended_us=?,epoch=?,metadata=? WHERE manifest_id=?",
+                        (ended, json.dumps(epoch), metadata.name, r["manifest_id"]),
                     )
                 finalize_capture(
                     p,
@@ -706,6 +719,9 @@ class CaptureController:
 
     def tick(self):
         with self.lock:
+            from recording_cleanup import resume
+
+            resume(self, 5)
             for r in self.db.execute(
                 "SELECT * FROM captures WHERE stop_pending=1 AND state!='ready'"
             ).fetchall():

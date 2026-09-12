@@ -64,6 +64,7 @@ class Tests(unittest.TestCase):
         self.write_artifacts()
 
     def tearDown(self):
+        self.controller.db.close()
         self.temp.cleanup()
 
     def add_row(self, tenant=TENANT, call=CALL, manifest=MANIFEST, state="ready"):

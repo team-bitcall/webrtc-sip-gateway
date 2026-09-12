@@ -80,6 +80,7 @@ class RecordingArtifacts:
             "list-ready": {"action", "after", "limit"},
             "manifest": {"action", "callId", "manifestId"},
             "chunk": {"action", "callId", "manifestId", "manifestSha256", "offset", "length"},
+            "acknowledge": {"action", "callId", "manifestId", "manifestSha256", "sha256", "sizeBytes"},
         }.get(action)
         if fields is None or not _exact(command, fields):
             _error("INVALID_RECORDING_REQUEST", 400)
@@ -95,9 +96,16 @@ class RecordingArtifacts:
                     or type(command["offset"]) is not int or command["offset"] < 0
                     or type(command["length"]) is not int or not 1 <= command["length"] <= MAX_CHUNK_BYTES):
                 _error("INVALID_RECORDING_REQUEST", 400)
+        if action == "acknowledge":
+            if (
+                not all(isinstance(command[key], str) and HEX64.fullmatch(command[key]) for key in ("manifestSha256", "sha256"))
+                or type(command["sizeBytes"]) is not int
+                or not 0 < command["sizeBytes"] <= 5 * 1024 * 1024 * 1024
+            ):
+                _error("INVALID_RECORDING_REQUEST", 400)
         return action
 
-    def _row(self, tenant, command):
+    def _row(self, tenant, command, ready_only=True):
         with self.controller.lock:
             row = self.controller.db.execute(
                 "SELECT rowid,* FROM captures WHERE tenant_id=? AND call_id=? AND manifest_id=?",
@@ -105,7 +113,7 @@ class RecordingArtifacts:
             ).fetchone()
         if not row:
             _error("RECORDING_NOT_FOUND", 404)
-        if row["state"] != "ready":
+        if ready_only and row["state"] != "ready":
             _error("RECORDING_NOT_READY", 409)
         return row
 
@@ -182,6 +190,10 @@ class RecordingArtifacts:
             more, rows = len(rows) > command["limit"], rows[: command["limit"]]
             items = [{"cursor": row["rowid"], "callId": row["call_id"], "manifestId": row["manifest_id"]} for row in rows]
             return {"items": items, "nextCursor": items[-1]["cursor"] if more else None}
+        if action == "acknowledge":
+            from recording_cleanup import acknowledge
+
+            return acknowledge(self.controller, tenant, command)
         row = self._row(tenant, command)
         manifest, raw, manifest_digest = self._manifest(row)
         if action == "manifest":
