@@ -38,9 +38,14 @@ def main():
             # Docker's archive API cannot reliably read a container tmpfs.
             # Copy only the known synthetic outputs through the live process.
             for filename in ('report.json', 'agent-source.wav', 'provider-source.wav',
-                             'recorded-agent.wav', 'recorded-provider.wav'):
+                             'recorded-agent.wav', 'recorded-provider.wav', 'capture-binding.json'):
                 with (args.artifacts / filename).open('xb') as output:
                     subprocess.run(['docker', 'exec', name, 'cat', '/tmp/artifacts/' + filename],
+                                   stdout=output, check=True, timeout=10)
+            for suffix in ('wav', 'json'):
+                filename = '7' * 32 + '.' + suffix
+                with (args.artifacts / filename).open('xb') as output:
+                    subprocess.run(['docker', 'exec', name, 'cat', '/tmp/finalized/' + filename],
                                    stdout=output, check=True, timeout=10)
         print('PASS isolated DTLS/SRTP recording and listen-only media proof', flush=True)
     except Exception:

@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import uuid
+import wave
 
 import av
 
@@ -21,6 +22,7 @@ from media_fixture import NgClient, PcmuPeer, parse_rtp, pcmu_decode_many, tone,
 from media_webrtc_peer import WebRtcPeer
 from call_journal import CallJournal
 from media_control import MediaController, MediaError
+from recording_capture import CaptureController
 
 def engine_resources():
     status = Path('/proc/1/status').read_text()
@@ -166,6 +168,7 @@ async def main():
     outage_listener = None
     control_process = None
     watchdog_process = None
+    capture_controller = None
     with NgClient() as ng, PcmuPeer(ssrc=0xB002) as provider, PcmuPeer(ssrc=0xCC03) as distractor, PcmuPeer(ssrc=0xDD04) as other_end:
         state = Path('/tmp/seat-state')
         state.mkdir(mode=0o700)
@@ -191,7 +194,6 @@ async def main():
             else: raise AssertionError('RTPengine not ready')
             forwarded = ng.request({**flags(route_values[0]), 'command': 'offer', 'call-id': call, 'from-tag': 'agent', 'sdp': await browser.offer()})
             response = ng.request({**flags(route_values[1]), 'command': 'answer', 'call-id': call, 'from-tag': 'agent', 'to-tag': 'provider', 'sdp': provider.sdp()})
-            ng.request({'command': 'start recording', 'call-id': call, 'metadata': 'task13-synthetic-call'})
             await browser.accept_answer(response['sdp'])
             tasks.append(asyncio.create_task(provider_loop(provider, audio_address(forwarded['sdp']), provider_source, captured, stop)))
             # A second, unrelated call is recorded as well: its SSRC must never enter the first file.
@@ -217,6 +219,22 @@ async def main():
             journal.append({'callId': cdr_id, 'type': 'answered', 'legId': 'provider', 'sipCode': 200,
                             'reason': None, 'endedBy': None})
             rpc.active.add(cdr_id)
+            finalized = Path('/tmp/finalized')
+            finalized.mkdir(mode=0o700)
+            for private_path in (RECORDINGS, RECORDINGS / 'pcaps', RECORDINGS / 'metadata', RECORDINGS / 'tmp'):
+                private_path.chmod(0o700)
+            capture_controller = CaptureController(state, journal, rpc,
+                projection=lambda _tenant: {"status": "applied", "validUntil": int(time.time()) + 120},
+                ng=controller.ng, spool=RECORDINGS, output=finalized,
+                limits={"maxInputBytes": 8 * 1024 * 1024, "maxOutputBytes": 8 * 1024 * 1024,
+                        "maxDurationSeconds": 60, "maxPackets": 10000})
+            capture_manifest_id = '7' * 32
+            capture_binding = {"tenantId": "fixture-customer", "gatewayId": "https://gateway.fixture.invalid",
+                               "callId": cdr_id, "publicCallId": '6' * 32, "membershipId": "fixture-member"}
+            (ARTIFACTS / 'capture-binding.json').write_text(json.dumps(capture_binding))
+            capture_start = capture_controller.handle(tenant, {"action": "start", "callId": cdr_id,
+                "manifestId": capture_manifest_id, "binding": capture_binding})
+            assert capture_start['state'] == 'capturing', capture_start
             start = {'action': 'start', 'callId': cdr_id, 'listenerId': listener_id,
                      'actorId': actor, 'leaseSeconds': 15}
             try:
@@ -340,6 +358,32 @@ async def main():
             report['sourceCallId'] = call
             report['otherCallId'] = other
             report['injectionAtElapsedMs'] = round((injected_at - started) * 1000, 1)
+            stop.set()
+            for task in tasks: task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            media_clock[0] = int(time.time() * 1000)
+            journal.append({'callId': cdr_id, 'type': 'ended', 'legId': 'provider',
+                            'sipCode': 200, 'reason': None, 'endedBy': 'agent'})
+            rpc.active.clear()
+            ng.request({'command': 'delete', 'call-id': call, 'delete-delay': 0})
+            capture_finished = capture_controller.handle(tenant, {'action': 'finish', 'callId': cdr_id,
+                                                                 'manifestId': capture_manifest_id})
+            if capture_finished['state'] != 'ready':
+                # Synthetic fixture only: bounded diagnostics before cleanup.
+                for entry in Path('/tmp/recording/metadata').glob('*.txt'):
+                    print('fixture metadata', entry.name, oct(entry.stat().st_mode & 0o777),
+                          entry.read_text()[:6000], flush=True)
+            assert capture_finished['state'] == 'ready', capture_finished
+            manifest = json.loads((finalized / (capture_manifest_id + '.json')).read_text())
+            assert all(manifest[key] == value for key, value in capture_binding.items())
+            with wave.open(str(finalized / (capture_manifest_id + '.wav')), 'rb') as audio:
+                assert (audio.getnchannels(), audio.getsampwidth(), audio.getframerate()) == (2, 2, 8000)
+                values = struct.unpack('<' + 'h' * 8000, audio.readframes(4000))
+                for channel, frequency in enumerate((440, 660)):
+                    require_tone(values[channel::2], frequency)
+            report['capture'] = {'manifestId': capture_manifest_id, 'state': 'ready',
+                                 'sizeBytes': manifest['sizeBytes'], 'sha256': manifest['sha256']}
+            report['checks'].append('trusted-live-capture-finalized-wav-manifest')
         finally:
             stop.set()
             for task in tasks: task.cancel()
@@ -351,6 +395,7 @@ async def main():
                 if process is not None and process.returncode is None:
                     process.kill()
                     await process.wait()
+            if capture_controller: capture_controller.close()
             controller.close(); journal.close()
             for current in (call, other):
                 ng.request({'command': 'delete', 'call-id': current, 'delete-delay': 0}, allow_error=True)
@@ -358,7 +403,7 @@ async def main():
     # Only inspect finalized files, never retain actual customer audio.
     recordings = list(RECORDINGS.rglob('*.pcap'))
     assert len(recordings) == 2, [path.name for path in recordings]
-    selected = [path for path in recordings if call in path.name]
+    selected = [path for path in recordings if path.name == capture_manifest_id + ".pcap"]
     assert len(selected) == 1, [path.name for path in recordings]
     other_files = [path for path in recordings if other in path.name]
     assert len(other_files) == 1 and any(packet.ssrc == 0xCC03 for _, packet, _ in pcap_packets(other_files[0]))

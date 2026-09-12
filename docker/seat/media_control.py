@@ -68,6 +68,51 @@ class NgClient:
                 return reply
 
 
+def resolve_media_call(tenant, call_id, *, journal, rpc, projection, ng, clock):
+    """Resolve all RTPengine identifiers only from durable, trusted evidence."""
+    try:
+        projection = projection(tenant)
+    except Exception as error:
+        raise MediaError("MEDIA_UNAVAILABLE") from error
+    if not isinstance(projection, dict) or projection.get("status") != "applied" \
+            or type(projection.get("validUntil")) is not int \
+            or projection["validUntil"] * 1000 <= clock():
+        raise MediaError("MEDIA_UNAVAILABLE")
+    with journal.lock:
+        row = journal.db.execute("SELECT context, terminal FROM calls WHERE call_id=? AND tenant_id=?",
+                                      (call_id, tenant)).fetchone()
+        if not row or row["terminal"]:
+            raise MediaError("MEDIA_UNAVAILABLE")
+        try:
+            context = json.loads(row["context"])
+            events = [json.loads(item["payload"]) for item in journal.db.execute(
+                "SELECT payload FROM events WHERE call_id=? ORDER BY sequence", (call_id,))]
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise MediaError("MEDIA_UNAVAILABLE") from error
+    answers = {event.get("legId") for event in events if event.get("type") == "answered"
+               and isinstance(event.get("legId"), str) and event.get("legId")}
+    if len(answers) != 1 or any(event.get("type") in {"ended", "uncertain"} for event in events):
+        raise MediaError("MEDIA_UNAVAILABLE")
+    sip_call_id, from_tag = context.get("sipCallId"), context.get("fromTag")
+    to_tag = next(iter(answers))
+    if not isinstance(sip_call_id, str) or not TAG.fullmatch(from_tag or "") or not TAG.fullmatch(to_tag):
+        raise MediaError("MEDIA_UNAVAILABLE")
+    try:
+        active = rpc.active_cdr_ids()
+    except Exception as error:
+        raise MediaError("MEDIA_UNAVAILABLE") from error
+    if call_id not in active:
+        raise MediaError("MEDIA_UNAVAILABLE")
+    query = ng.request({"command": "query", "call-id": sip_call_id})
+    tags = query.get("tags")
+    if query.get("result") != "ok" or not isinstance(tags, dict) or not 2 <= len(tags) <= 64 \
+            or not all(isinstance(tag, str) and TAG.fullmatch(tag) and isinstance(item, dict)
+                       for tag, item in tags.items()) \
+            or from_tag not in tags or to_tag not in tags:
+        raise MediaError("MEDIA_UNAVAILABLE")
+    return sip_call_id, [from_tag, to_tag]
+
+
 class MediaController:
     """Durable lease state with bounded listener tags per still-live source call.
 
@@ -158,48 +203,8 @@ class MediaController:
         return hashlib.sha256(sdp.encode("utf-8")).hexdigest()
 
     def _call(self, tenant, call_id):
-        """Resolve all RTPengine identifiers only from durable, trusted evidence."""
-        try:
-            projection = self.projection(tenant)
-        except Exception as error:
-            raise MediaError("MEDIA_UNAVAILABLE") from error
-        if not isinstance(projection, dict) or projection.get("status") != "applied" \
-                or type(projection.get("validUntil")) is not int \
-                or projection["validUntil"] * 1000 <= self.clock():
-            raise MediaError("MEDIA_UNAVAILABLE")
-        with self.journal.lock:
-            row = self.journal.db.execute("SELECT context, terminal FROM calls WHERE call_id=? AND tenant_id=?",
-                                          (call_id, tenant)).fetchone()
-            if not row or row["terminal"]:
-                raise MediaError("MEDIA_UNAVAILABLE")
-            try:
-                context = json.loads(row["context"])
-                events = [json.loads(item["payload"]) for item in self.journal.db.execute(
-                    "SELECT payload FROM events WHERE call_id=? ORDER BY sequence", (call_id,))]
-            except (TypeError, ValueError, json.JSONDecodeError) as error:
-                raise MediaError("MEDIA_UNAVAILABLE") from error
-        answers = {event.get("legId") for event in events if event.get("type") == "answered"
-                   and isinstance(event.get("legId"), str) and event.get("legId")}
-        if len(answers) != 1 or any(event.get("type") in {"ended", "uncertain"} for event in events):
-            raise MediaError("MEDIA_UNAVAILABLE")
-        sip_call_id, from_tag = context.get("sipCallId"), context.get("fromTag")
-        to_tag = next(iter(answers))
-        if not isinstance(sip_call_id, str) or not TAG.fullmatch(from_tag or "") or not TAG.fullmatch(to_tag):
-            raise MediaError("MEDIA_UNAVAILABLE")
-        try:
-            active = self.rpc.active_cdr_ids()
-        except Exception as error:
-            raise MediaError("MEDIA_UNAVAILABLE") from error
-        if call_id not in active:
-            raise MediaError("MEDIA_UNAVAILABLE")
-        query = self.ng.request({"command": "query", "call-id": sip_call_id})
-        tags = query.get("tags")
-        if query.get("result") != "ok" or not isinstance(tags, dict) or not 2 <= len(tags) <= 64 \
-                or not all(isinstance(tag, str) and TAG.fullmatch(tag) and isinstance(item, dict)
-                           for tag, item in tags.items()) \
-                or from_tag not in tags or to_tag not in tags:
-            raise MediaError("MEDIA_UNAVAILABLE")
-        return sip_call_id, [from_tag, to_tag]
+        return resolve_media_call(tenant, call_id, journal=self.journal, rpc=self.rpc,
+                                  projection=self.projection, ng=self.ng, clock=self.clock)
 
     def _row(self, tenant, listener):
         return self.db.execute("SELECT * FROM sessions WHERE tenant_id=? AND listener_id=?", (tenant, listener)).fetchone()
