@@ -493,6 +493,9 @@ class CaptureController:
 
     def start(self, t, v):
         with self.lock:
+            from recording_reconciliation import blocked
+            if blocked(self, v["callId"], v["manifestId"]):
+                self._err("RECORDING_RECONCILED")
             b = self._binding(v["callId"], v["binding"])
             canon = json.dumps(b, sort_keys=True, separators=(",", ":"))
             requested_max = v.get("maxOutputBytes")
