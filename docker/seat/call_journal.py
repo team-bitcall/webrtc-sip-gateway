@@ -272,7 +272,13 @@ class CallJournal:
             raise JournalError("JOURNAL_CONFIG_INVALID")
         cutoff = int(self.clock()) - retention_ms
         with self.lock, self.db:
+            tables = {row[0] for row in self.db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             self.db.execute("DELETE FROM events WHERE acked_at IS NOT NULL AND acked_at<=? AND call_id IN "
                             "(SELECT call_id FROM calls WHERE terminal=1 AND terminal_at<=?)", (cutoff, cutoff))
+            removable = "call_id IN (SELECT call_id FROM calls WHERE terminal=1 AND terminal_at<=? AND NOT EXISTS (SELECT 1 FROM events WHERE events.call_id=calls.call_id))"
+            if "media_observations" in tables:
+                self.db.execute("DELETE FROM media_observations WHERE " + removable, (cutoff,))
+            if "media_closures" in tables:
+                self.db.execute("DELETE FROM media_closures WHERE " + removable, (cutoff,))
             self.db.execute("DELETE FROM calls WHERE terminal=1 AND terminal_at<=? AND NOT EXISTS "
                             "(SELECT 1 FROM events WHERE events.call_id=calls.call_id)", (cutoff,))

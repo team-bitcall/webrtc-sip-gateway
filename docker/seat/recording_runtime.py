@@ -12,6 +12,7 @@ from urllib.parse import quote
 
 from media_control import NgClient
 from recording_capture import CaptureController
+from media_journal import media_checkpoint
 from recording_transport import (
     RecordingTransportError,
     RecordingTransportServer,
@@ -211,6 +212,7 @@ class RecordingRuntime:
                 ng=ng if ng is not None else NgClient(),
                 spool=config["spool"],
                 output=config["output"],
+                media_guard=lambda call_id, require_closed=False: media_checkpoint(self.journal, call_id, require_closed),
             )
             self.server = RecordingTransportServer(
                 config["state"],

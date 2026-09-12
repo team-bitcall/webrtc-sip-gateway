@@ -24,6 +24,7 @@ from compile_snapshot import (ID_RE, MAX_BYTES, SnapshotError, USER_RE, _atomic_
 from media_control import MediaController, MediaError
 from recording_transport import forward_recording, RecordingTransportError
 from recording_capture import CaptureError
+from media_journal import MediaJournal
 
 
 class ControlError(Exception):
@@ -599,6 +600,8 @@ class JournalHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
     def do_POST(self):
         try:
+            if self.headers.get("Origin") is not None:
+                raise ControlError(403, "SERVER_CLIENT_REQUIRED")
             if len(self.headers.get_all("Authorization", [])) != 1 or not hmac.compare_digest(
                     self.headers.get("Authorization", "").encode(), ("Bearer " + self.server.token).encode()):
                 raise ControlError(401, "UNAUTHORIZED")
@@ -616,6 +619,15 @@ class JournalHandler(http.server.BaseHTTPRequestHandler):
                 result = {"schemaVersion": 1, "callId": call_id}
             elif self.path == "/v1/call-events/append":
                 result = self.server.journal.append(body)
+            elif self.path == "/v1/call-events/media/begin":
+                if getattr(self.server, "media_journal", None) is None: raise ControlError(404, "NOT_FOUND")
+                result = self.server.media_journal.begin(body)
+            elif self.path == "/v1/call-events/media/complete":
+                if getattr(self.server, "media_journal", None) is None: raise ControlError(404, "NOT_FOUND")
+                result = self.server.media_journal.complete(body)
+            elif self.path == "/v1/call-events/media/close":
+                if getattr(self.server, "media_journal", None) is None: raise ControlError(404, "NOT_FOUND")
+                result = self.server.media_journal.media_closure(body)
             else:
                 raise ControlError(404, "NOT_FOUND")
             self._reply(200, result)
@@ -653,6 +665,8 @@ def main():
                                   os.environ.get("SEAT_DOMAIN", ""), KamailioRpc())
     events_enabled = os.environ.get("SEAT_CALL_EVENTS") == "1"
     journal = CallJournal(directory) if events_enabled else None
+    recording_enabled = os.environ.get("SEAT_RECORDING_ENABLED") == "1"
+    media_journal = MediaJournal(journal) if recording_enabled and journal else None
     media_enabled = os.environ.get("SEAT_MEDIA_ENABLED") == "1"
     if media_enabled and journal is None:
         raise ControlError(503, "MEDIA_UNAVAILABLE")
@@ -666,7 +680,7 @@ def main():
                                 projection=store.status)
     server = http.server.HTTPServer((host, int(os.environ.get("SEAT_CONTROL_PORT", "8881"))), ControlHandler)
     server.store, server.journal, server.media, server.token = store, journal, media, token
-    server.recording_directory = directory if os.environ.get("SEAT_RECORDING_ENABLED") == "1" else None
+    server.recording_directory = directory if recording_enabled else None
     if server.recording_directory is not None and journal is None:
         raise ControlError(503, "RECORDING_CALL_EVENTS_REQUIRED")
     server.control_boot_id = str(uuid.uuid4())
@@ -703,7 +717,7 @@ def main():
     journal_server = journal_worker = None
     if journal:
         journal_server = http.server.ThreadingHTTPServer(("127.0.0.1", 8882), JournalHandler)
-        journal_server.journal, journal_server.token = journal, token
+        journal_server.journal, journal_server.token, journal_server.media_journal = journal, token, media_journal
         journal_worker = threading.Thread(target=journal_server.serve_forever, daemon=True)
         journal_worker.start()
     try:

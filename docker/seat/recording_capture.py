@@ -93,11 +93,15 @@ class CaptureController:
         maxSpoolBytes=128 * 1024 * 1024,
         maxConcurrent=5,
         maxJobs=100,
+        media_guard=None,
     ):
         self.lock = threading.RLock()
         self.db = None
         self.owner = None
         self.closed = False
+        if media_guard is not None and not callable(media_guard):
+            raise ValueError("media_guard must be callable")
+        self.media_guard = media_guard
         try:
             self.directory, self.spool, self.output = (
                 _dir(directory),
@@ -177,6 +181,21 @@ class CaptureController:
         except Exception:
             self._release()
             raise
+
+    def _media_checkpoint(self, call_id, require_closed=False):
+        """Production injects a read-only guard; isolated media fixtures may omit it."""
+        if self.media_guard is None:
+            return None
+        try:
+            value = self.media_guard(call_id, require_closed=require_closed)
+            if (not isinstance(value, dict) or set(value) != {"revision", "digest", "closed"}
+                    or type(value["revision"]) is not int or not 1 <= value["revision"] <= 128
+                    or not isinstance(value["digest"], str) or not re.fullmatch(r"[a-f0-9]{64}", value["digest"])
+                    or type(value["closed"]) is not bool or value["closed"] != require_closed):
+                raise ValueError("invalid media evidence")
+            return {"revision": value["revision"], "digest": value["digest"]}
+        except Exception as error:
+            raise CaptureError("RECORDING_MEDIA_UNCERTAIN", 409) from error
 
     def _config(self):
         L = self.limits
@@ -481,6 +500,7 @@ class CaptureController:
                 >= self.max_concurrent
             ):
                 self._err("RECORDING_LIMIT")
+            media_checkpoint = self._media_checkpoint(v["callId"])
             sip, tags = self._resolve(t, v["callId"])
             query = self.ng.request({"command": "query", "call-id": sip})
             sources = self._source(query, tags)
@@ -492,6 +512,8 @@ class CaptureController:
                 "startedAtUs": now,
                 "endedAtUs": now + self.limits["maxDurationSeconds"] * 1000000,
             }
+            if media_checkpoint is not None:
+                epoch["mediaCheckpoint"] = media_checkpoint
             pcap = self.pcaps / (v["manifestId"] + ".pcap")
             if pcap.exists() or pcap.is_symlink():
                 self._err("RECORDING_CONFLICT")
@@ -521,6 +543,8 @@ class CaptureController:
                 )
                 if not isinstance(reply, dict) or reply.get("result") != "ok":
                     raise CaptureError("RECORDING_UNAVAILABLE")
+                if self._media_checkpoint(v["callId"]) != media_checkpoint:
+                    raise CaptureError("RECORDING_MEDIA_UNCERTAIN", 409)
                 with self.db:
                     self.db.execute(
                         "UPDATE captures SET state='capturing' WHERE manifest_id=?",
@@ -655,6 +679,8 @@ class CaptureController:
             try:
                 p, metadata = self._files(r)
                 epoch = json.loads(r["epoch"])
+                if self.media_guard is not None and self._media_checkpoint(r["call_id"], require_closed=True) != epoch.get("mediaCheckpoint"):
+                    self._err("RECORDING_MEDIA_CHANGED", 409)
                 epoch["endedAtUs"] = ended
                 if (
                     not epoch["startedAtUs"]

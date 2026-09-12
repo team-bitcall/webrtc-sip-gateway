@@ -23,6 +23,7 @@ sys.path.insert(0, "/seat-proof")
 from media_fixture import NgClient, PcmuPeer, parse_rtp, pcmu_decode_many, tone, tone_energies, write_wav
 from media_webrtc_peer import WebRtcPeer
 from call_journal import CallJournal
+from media_journal import MediaJournal
 from media_control import MediaController, MediaError
 from recording_transport import forward_recording
 
@@ -194,8 +195,10 @@ async def main():
                     ng.request({'command': 'ping'}); break
                 except (OSError, TimeoutError): await asyncio.sleep(.1)
             else: raise AssertionError('RTPengine not ready')
-            forwarded = ng.request({**flags(route_values[0]), 'command': 'offer', 'call-id': call, 'from-tag': 'agent', 'sdp': await browser.offer()})
-            response = ng.request({**flags(route_values[1]), 'command': 'answer', 'call-id': call, 'from-tag': 'agent', 'to-tag': 'provider', 'sdp': provider.sdp()})
+            source_offer = await browser.offer()
+            source_answer = provider.sdp()
+            forwarded = ng.request({**flags(route_values[0]), 'command': 'offer', 'call-id': call, 'from-tag': 'agent', 'sdp': source_offer})
+            response = ng.request({**flags(route_values[1]), 'command': 'answer', 'call-id': call, 'from-tag': 'agent', 'to-tag': 'provider', 'sdp': source_answer})
             await browser.accept_answer(response['sdp'])
             tasks.append(asyncio.create_task(provider_loop(provider, audio_address(forwarded['sdp']), provider_source, captured, stop)))
             # A second, unrelated call is recorded as well: its SSRC must never enter the first file.
@@ -218,6 +221,15 @@ async def main():
                                                'sipCallId': call, 'fromTag': 'agent', 'legId': '',
                                                'destination': '+12025550100', 'requestedCallerId': None,
                                                'effectiveCallerId': '+12025550101'})
+            # This NG-only fixture seeds the same sanitized evidence as Kamailio.
+            # It validates the real capture guard, not the SIP hook delivery path.
+            media_journal = MediaJournal(journal)
+            for revision, sdp in enumerate((source_offer, source_answer), start=1):
+                media_journal.begin({'callId': cdr_id, 'revision': revision, 'method': 'INVITE',
+                    'fromTag': 'agent', 'toTag': '' if revision == 1 else 'provider',
+                    'sipCode': 0 if revision == 1 else 200,
+                    'sdpSha256': hashlib.sha256(sdp.encode()).hexdigest()})
+                media_journal.complete({'callId': cdr_id, 'revision': revision, 'success': True})
             journal.append({'callId': cdr_id, 'type': 'answered', 'legId': 'provider', 'sipCode': 200,
                             'reason': None, 'endedBy': None})
             rpc.active.add(cdr_id)
@@ -382,6 +394,7 @@ async def main():
             for task in tasks: task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             media_clock[0] = int(time.time() * 1000)
+            media_journal.media_closure({'callId': cdr_id, 'count': 2, 'unsafe': False})
             journal.append({'callId': cdr_id, 'type': 'ended', 'legId': 'provider',
                             'sipCode': 200, 'reason': None, 'endedBy': 'agent'})
             rpc.active.clear()

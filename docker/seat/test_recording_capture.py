@@ -1,5 +1,6 @@
 import json, os, sqlite3, sys, tempfile, threading, unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).parent))
 from recording_capture import CaptureController, CaptureError
@@ -276,6 +277,57 @@ class Tests(unittest.TestCase):
         self.assertIn(
             {"command": "stop recording", "call-id": "sip-" + CALL}, self.ng.calls
         )
+
+    def _closed_files(self):
+        pcap = self.c.pcaps / (MAN + ".pcap")
+        metadata = self.c.metadata / "closed.txt"
+        pcap.write_bytes(b"fixture")
+        metadata.write_text(str(pcap) + "\nbitcall-recording:" + MAN + "\n")
+        os.chmod(pcap, 0o600)
+        os.chmod(metadata, 0o600)
+
+    def test_media_guard_stable_checkpoint_allows_ready(self):
+        checkpoint = {"revision": 1, "digest": "d" * 64}
+        self.c.close()
+        self.c = self.make(media_guard=lambda *_args, **kwargs: {**checkpoint, "closed": bool(kwargs.get("require_closed"))})
+        self.c.clock = lambda: 1_000_000
+        self.start()
+        self._closed_files()
+        self.j.end()
+        self.rpc.active, self.ng.unknown = set(), True
+        with mock.patch("recording_capture.finalize_capture", return_value={}):
+            self.assertEqual(self.c.handle(TEN, {"action": "finish", "callId": CALL, "manifestId": MAN})["state"], "ready")
+
+    def test_media_guard_change_during_start_fails_and_stops(self):
+        calls = []
+        def guard(*_args, **_kwargs):
+            calls.append(1)
+            return {"revision": len(calls), "digest": ("a" if len(calls) == 1 else "b") * 64, "closed": False}
+        self.c.close()
+        self.c = self.make(media_guard=guard)
+        self.assertEqual(self.start()["state"], "failed")
+        self.assertIn({"command": "stop recording", "call-id": "sip-" + CALL}, self.ng.calls)
+
+    def test_media_guard_already_closed_rejects_start(self):
+        self.c.close()
+        self.c = self.make(media_guard=lambda *_args, **_kwargs: {"revision": 1, "digest": "d" * 64, "closed": True})
+        with self.assertRaisesRegex(CaptureError, "RECORDING_MEDIA_UNCERTAIN"):
+            self.start()
+
+    def test_media_guard_missing_or_unsafe_close_never_writes_wav(self):
+        for closed in (False,):
+            with self.subTest(closed=closed):
+                checkpoint = {"revision": 1, "digest": "d" * 64, "closed": closed}
+                self.c.close()
+                self.c = self.make(media_guard=lambda *_args, **kwargs: {**checkpoint, "closed": closed if kwargs.get("require_closed") else False})
+                self.c.clock = lambda: 1_000_000
+                self.start()
+                self._closed_files()
+                self.j.end()
+                self.rpc.active, self.ng.unknown = set(), True
+                result = self.c.handle(TEN, {"action": "finish", "callId": CALL, "manifestId": MAN})
+                self.assertEqual(result["state"], "failed")
+                self.assertEqual(list((self.r / "out").iterdir()), [])
 
 
 if __name__ == "__main__":

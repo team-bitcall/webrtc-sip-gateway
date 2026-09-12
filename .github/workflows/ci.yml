@@ -85,6 +85,9 @@ jobs:
       - name: Durable per-agent call events and terminal outcomes
         run: python3 docker/healthcheck/smoke_seat_routing.py --image webrtc-sip-gateway:ci --managed --call-events --presence
 
+      - name: Recording negotiation hooks and disabled compatibility
+        run: python3 docker/healthcheck/smoke_recording_media_hooks.py --image webrtc-sip-gateway:ci
+
       - name: Browser DTLS role stays passive from offer through answer
         run: python3 docker/healthcheck/smoke_dtls_role.py --image webrtc-sip-gateway:ci
 

@@ -85,3 +85,29 @@ The spool is temporary but required for the current PCAP/finalization pipeline.
 Long-term audio lives in S3. Files remain until the trusted backend confirms verified
 storage; gateway state and receipts must survive restart. S3 lifecycle policy must
 preserve objects for the promised customer retention period.
+
+## Durable media observation guard
+
+When managed recording is enabled, Kamailio journals INVITE/UPDATE SDP handling on
+loopback port 8882 using the existing server bearer token. The private routes are
+`/v1/call-events/media/begin`, `/complete` and `/close` under that same prefix.
+Begin persists a pending revision before RTPengine mutation; complete marks it
+applied or failed. Closure records the final revision count and sticky uncertainty.
+These routes are absent when recording is disabled and reject browser Origin.
+
+The journal stores only bounded sanitized metadata and an SDP SHA-256, never raw
+SDP or ICE secrets. Each call permits at most 128 revisions. Every begin represents
+a mutation, so duplicate begin is unsafe even when the payload is identical;
+concurrent collisions cannot be mistaken for a stable checkpoint. Evidence follows
+the existing acknowledged terminal-call retention boundary.
+
+The production capture worker requires an open contiguous applied checkpoint
+before and after NG start, and the identical checkpoint with safe closure before
+finalization. Missing/failed/changed/late evidence refuses a recording. ACK with SDP
+sets uncertainty; PRACK retains the existing managed-route rejection. SIP routing
+continues if the journal is unavailable. Observation writes use the existing bounded
+HTTP timeout, so outage may add signaling latency while refusing recording.
+
+This guard does not decode multiple media epochs. Exact codec/transport/source-leg
+mapping to RTPengine packet boundaries, ICE restart and re-INVITE acceptance remain
+open. The stable IPv4 PCMU/PCMA pilot restriction remains in force.
