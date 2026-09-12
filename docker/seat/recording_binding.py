@@ -89,6 +89,8 @@ def validate_capture_request(controller, tenant, request, gateway_id, now_ms):
     fields = {"action", "callId", "manifestId"}
     if command["action"] == "start":
         fields |= {"binding", "admission"}
+        if "maxOutputBytes" in command:
+            fields.add("maxOutputBytes")
     if not _exact(command, fields) or not all(
         isinstance(command.get(key), str) and HEX.fullmatch(command[key])
         for key in ("callId", "manifestId")
@@ -96,6 +98,9 @@ def validate_capture_request(controller, tenant, request, gateway_id, now_ms):
         _reject()
     if command["action"] != "start":
         return dict(command)
+    if "maxOutputBytes" in command and (type(command["maxOutputBytes"]) is not int
+            or not 44 <= command["maxOutputBytes"] <= 5 * 1024 * 1024 * 1024):
+        _reject()
     binding, admission = command["binding"], command["admission"]
     if not _exact(
         binding, ("tenantId", "gatewayId", "callId", "publicCallId", "membershipId")

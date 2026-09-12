@@ -75,6 +75,13 @@ class RecordingBindingTests(unittest.TestCase):
         self.assertEqual(command["binding"], self.command["binding"])
         self.assertEqual(command, self.validate())
 
+    def test_optional_output_cap_is_preserved_and_bounded(self):
+        command = copy.deepcopy(self.command); command["maxOutputBytes"] = 44
+        self.assertEqual(self.validate(command)["maxOutputBytes"], 44)
+        for value in (True, 43, 5 * 1024 * 1024 * 1024 + 1):
+            command["maxOutputBytes"] = value
+            with self.assertRaises(CaptureError): self.validate(command)
+
     def test_rejects_cross_tenant_gateway_and_historical_seat_revision(self):
         changes = [
             ("binding", "tenantId", "other"),

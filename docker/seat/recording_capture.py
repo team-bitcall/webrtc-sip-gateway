@@ -306,9 +306,16 @@ class CaptureController:
         req = {"action", "callId", "manifestId"} | (
             {"binding"} if v["action"] == "start" else set()
         )
+        if v.get("action") == "start" and "maxOutputBytes" in v:
+            req.add("maxOutputBytes")
         if set(v) != req or not all(
             isinstance(v.get(k), str) and HEX.fullmatch(v[k])
             for k in ("callId", "manifestId")
+        ):
+            self._err("INVALID_RECORDING_REQUEST", 400)
+        if "maxOutputBytes" in v and (
+            type(v["maxOutputBytes"]) is not int
+            or not 44 <= v["maxOutputBytes"] <= 5 * 1024 * 1024 * 1024
         ):
             self._err("INVALID_RECORDING_REQUEST", 400)
         return v
@@ -488,6 +495,7 @@ class CaptureController:
         with self.lock:
             b = self._binding(v["callId"], v["binding"])
             canon = json.dumps(b, sort_keys=True, separators=(",", ":"))
+            requested_max = v.get("maxOutputBytes")
             r = self.db.execute(
                 "SELECT * FROM captures WHERE manifest_id=? OR call_id=?",
                 (v["manifestId"], v["callId"]),
@@ -498,6 +506,7 @@ class CaptureController:
                     and r["call_id"] == v["callId"]
                     and r["tenant_id"] == t
                     and r["binding"] == canon
+                    and json.loads(r["epoch"] or "{}").get("requestedMaxOutputBytes") == requested_max
                 ):
                     return self._reply(r)
                 self._err("RECORDING_CONFLICT")
@@ -532,6 +541,8 @@ class CaptureController:
                 "sources": sources,
                 "startedAtUs": now,
                 "endedAtUs": now + self.limits["maxDurationSeconds"] * 1000000,
+                "requestedMaxOutputBytes": requested_max,
+                "maxOutputBytes": min(self.limits["maxOutputBytes"], requested_max) if requested_max is not None else self.limits["maxOutputBytes"],
             }
             epoch["captureMode"] = "subscription-v1" if self.producer is not None else "pcap-v1"
             if media_checkpoint is not None:
@@ -764,7 +775,13 @@ class CaptureController:
                     r["manifest_id"],
                     json.loads(r["binding"]),
                     epoch,
-                    self.limits,
+                    {
+                        **self.limits,
+                        "maxOutputBytes": min(
+                            epoch.get("maxOutputBytes", self.limits["maxOutputBytes"]),
+                            self.limits["maxOutputBytes"],
+                        ),
+                    },
                     on_publish=lambda receipt: self._publish_receipt(r["manifest_id"], receipt),
                 )
                 with self.db:

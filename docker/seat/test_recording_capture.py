@@ -173,12 +173,12 @@ class Tests(unittest.TestCase):
             self.c.close()
         self.tmp.cleanup()
 
-    def start(self, call=CALL, man=MAN, binding=None):
+    def start(self, call=CALL, man=MAN, binding=None, max_output=None):
         b = dict(self.bind if binding is None else binding)
         b["callId"] = call
-        return self.c.handle(
-            TEN, {"action": "start", "callId": call, "manifestId": man, "binding": b}
-        )
+        command = {"action": "start", "callId": call, "manifestId": man, "binding": b}
+        if max_output is not None: command["maxOutputBytes"] = max_output
+        return self.c.handle(TEN, command)
 
     def test_replay_wrong_tenant_and_slots(self):
         self.assertEqual(self.start()["state"], "capturing")
@@ -197,6 +197,20 @@ class Tests(unittest.TestCase):
         m2 = "e" * 32
         with self.assertRaisesRegex(CaptureError, "RECORDING_LIMIT"):
             self.start(c2, m2)
+
+    def test_output_cap_is_persisted_and_replay_cannot_change_it(self):
+        self.assertEqual(self.start(max_output=44)["state"], "capturing")
+        self.assertEqual(json.loads(self.c.db.execute("SELECT epoch FROM captures").fetchone()[0])["maxOutputBytes"], 44)
+        with self.assertRaisesRegex(CaptureError, "RECORDING_CONFLICT"):
+            self.start(max_output=45)
+
+    def test_restart_retains_persisted_output_cap_and_legacy_uses_default(self):
+        self.assertEqual(self.start(max_output=44)["state"], "capturing")
+        self.c.close(); self.c = self.make(); self.c.recover()
+        self.assertEqual(json.loads(self.c.db.execute("SELECT epoch FROM captures").fetchone()[0])["maxOutputBytes"], 44)
+        self.c.close(); self.c = self.make()
+        self.assertEqual(self.start("d" * 32, "e" * 32)["state"], "capturing")
+        self.assertEqual(json.loads(self.c.db.execute("SELECT epoch FROM captures WHERE manifest_id=?", ("e" * 32,)).fetchone()[0])["maxOutputBytes"], self.c.limits["maxOutputBytes"])
 
     def test_second_owner_blocked_then_released(self):
         with self.assertRaisesRegex(CaptureError, "RECORDING_ALREADY_RUNNING"):

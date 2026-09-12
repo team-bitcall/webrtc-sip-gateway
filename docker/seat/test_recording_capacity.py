@@ -13,7 +13,7 @@ import wave
 sys.path.insert(0, str(Path(__file__).parent))
 from recording_capture import CaptureController, CaptureError
 import recording_decode
-from recording_decode import finalize_capture
+from recording_decode import RecordingDecodeError, finalize_capture
 from test_recording_capture import Journal, NG, Resolver, Rpc, TEN
 from test_recording_decode import packet, pcap, rtp
 
@@ -139,6 +139,12 @@ class DecoderFailureTests(unittest.TestCase):
         self.assertEqual((samples[80 * 2], samples[80 * 2 + 1]), (8, -8))
         self.assertEqual((samples[300 * 2], samples[300 * 2 + 1]), (0, 0))
         self.assertEqual((samples[400 * 2], samples[400 * 2 + 1]), (8, -8))
+
+    def test_real_decode_rejects_lower_persisted_output_cap(self):
+        self.write(self.records_with_loss())
+        limits = {**self.limits, "maxOutputBytes": 2283}
+        with self.assertRaisesRegex(RecordingDecodeError, "output limit exceeded"):
+            finalize_capture(self.capture, self.root, "e" * 32, self.binding, self.epoch, limits)
 
     def test_decoder_exception_removes_owned_partial_and_final_artifacts(self):
         self.write(self.records_with_loss())
