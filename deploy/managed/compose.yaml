@@ -1,0 +1,39 @@
+name: bitcall-gateway-managed
+services:
+  gateway:
+    # The validator requires an immutable digest; never use a floating tag here.
+    image: ${BITCALL_GATEWAY_IMAGE:?Set an image pinned with @sha256}
+    network_mode: host
+    read_only: true
+    restart: unless-stopped
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    env_file:
+      - ${GATEWAY_ENV_FILE:?Set external base gateway env file}
+      - ${MANAGED_ENV_FILE:?Set external private managed env file}
+    environment:
+      SEAT_MODE: managed
+      SEAT_CONTROL_BIND: 127.0.0.1
+      SEAT_STATE_DIR: /var/lib/bitcall/seat-state
+      SEAT_RECORDING_SPOOL_DIR: /var/lib/bitcall/recording-spool
+      SEAT_RECORDING_OUTPUT_DIR: /var/lib/bitcall/recording-output
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=128m
+      - /run:rw,exec,nosuid,nodev,size=128m
+    volumes:
+      - ${SEAT_STATE_HOST_DIR:?Set dedicated durable state directory}:/var/lib/bitcall/seat-state:rw
+      - ${RECORDING_SPOOL_HOST_DIR:?Set dedicated bounded spool directory}:/var/lib/bitcall/recording-spool:rw
+      - ${RECORDING_OUTPUT_HOST_DIR:?Set dedicated durable output directory}:/var/lib/bitcall/recording-output:rw
+      - ${TLS_CERT:?Set TLS certificate path}:/etc/ssl/cert.pem:ro
+      - ${TLS_KEY:?Set TLS key path}:/etc/ssl/key.pem:ro
+      - ${KAMAILIO_CONFIG:?Set rendered Kamailio config}:/etc/kamailio/kamailio.cfg:ro
+      - ${ACME_WEBROOT:?Set ACME webroot}:/var/www/acme:ro
+    logging:
+      driver: local
+      options: { max-size: 10m, max-file: '3' }
+    healthcheck:
+      test: [CMD-SHELL, 'pgrep -x kamailio >/dev/null && rtpengine-ctl -ip 127.0.0.1 -port 7722 list numsessions >/dev/null']
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
