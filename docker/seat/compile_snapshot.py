@@ -173,7 +173,7 @@ def validate_snapshot(data, now=None):
     for index, item in enumerate(seats_in):
         path = "seats[%d]" % index
         _optional_keys(item, ("id", "tenantId", "username", "profileId", "enabled", "ha1"),
-                       ("callerIdPolicy", "admissionPolicy"), path)
+                       ("callerIdPolicy", "admissionPolicy", "managedAdmission"), path)
         seat_id = _string(item["id"], path + ".id", pattern=ID_RE)
         username = _string(item["username"], path + ".username", pattern=USER_RE)
         tenant_id = _string(item["tenantId"], path + ".tenantId", pattern=ID_RE)
@@ -236,6 +236,8 @@ def validate_snapshot(data, now=None):
                 "maxRegisteredConnections": connections,
                 "maxActiveCalls": calls,
             }
+        if "managedAdmission" in item:
+            seat["managedAdmission"] = _boolean(item["managedAdmission"], path + ".managedAdmission")
         seats.append(seat)
     return {
         "revision": revision,
@@ -285,6 +287,8 @@ def snapshot_entries(normalized, tenant_id):
                             admission["maxRegisteredConnections"]))
             entries.append(("seat_users", seat_prefix + "admission_max_calls",
                             admission["maxActiveCalls"]))
+        if seat.get("managedAdmission"):
+            entries.append(("seat_users", seat_prefix + "managed_admission", 1))
     for profile in normalized["profiles"]:
         if profile["tenantId"] != tenant_id:
             continue

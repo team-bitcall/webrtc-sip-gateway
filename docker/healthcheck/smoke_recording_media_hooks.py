@@ -57,12 +57,33 @@ request_route {
 '''
 
 
+def assert_main_route_hook_order(path=Path('/hook-proof/kamailio.cfg')):
+    """Keep the native hook fixture coupled to the managed RTPengine route.
+
+    Calling the hook routes directly below validates their serialization, but it
+    would not catch a rendered main configuration that simply omits them.
+    """
+    source = path.read_text()
+    start = source.index('route[NATMANAGE] {')
+    end = source.index('route[RELAY] {', start)
+    route = source[start:end]
+    begin = 'route(RECORDING_MEDIA_BEGIN);'
+    reset = '$var(recording_rtp_ok) = 0;'
+    manage = 'rtpengine_manage("$var(rtpflags)")'
+    complete = 'route(RECORDING_MEDIA_COMPLETE);'
+    assert all(item in route for item in (begin, reset, manage, complete)), route
+    assert route.index(begin) < route.index(reset) < route.index(manage) < route.index(complete), route
+    assert '#!ifdef WITH_SEAT_CALL_EVENTS\n    ' + begin + '\n#!endif' in route, route
+    assert '#!ifdef WITH_SEAT_CALL_EVENTS\n    ' + complete + '\n#!endif' in route, route
+
+
 def inside():
     sys.path.insert(0, '/seat-proof')
     from call_journal import CallJournal, JournalError
     from media_journal import MediaJournal
     from provisioning import JournalHandler
 
+    assert_main_route_hook_order()
     with tempfile.TemporaryDirectory() as directory:
         journal = CallJournal(directory)
         media = MediaJournal(journal)
@@ -135,7 +156,7 @@ def inside():
                             process.kill(); process.wait(timeout=5)
         finally:
             server.shutdown(); server.server_close(); thread.join(2); journal.close()
-        print('PASS recording hooks: ' + ', '.join(checks), flush=True)
+        print('PASS recording hooks: main-route-hook-order, ' + ', '.join(checks), flush=True)
 
 
 def main():
@@ -147,6 +168,20 @@ def main():
     if not args.image: parser.error('--image is required')
     source = Path(__file__).resolve()
     docker = source.parents[1]
+    image_only = r'''
+import sys
+sys.path.insert(0, '/opt/bitcall/seat')
+import recording_runtime
+import recording_reconciliation
+import recording_artifacts
+import recording_cleanup
+print('PASS packaged recording reconcile imports')
+'''
+    subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
+        '--tmpfs', '/tmp:rw,size=16m', '--tmpfs', '/run:rw,size=4m',
+        '--cpus', '1', '--memory', '256m', '--pids-limit', '64',
+        '--security-opt', 'no-new-privileges:true', '--entrypoint', 'python3',
+        args.image, '-c', image_only], check=True, timeout=45)
     subprocess.run(['docker', 'run', '--rm', '--network', 'none', '--read-only',
         '--tmpfs', '/tmp:rw,size=16m', '--tmpfs', '/run:rw,size=4m',
         '--cpus', '1', '--memory', '256m', '--pids-limit', '64',

@@ -108,9 +108,10 @@ class SubscriptionProducer:
                     sockets.append(sock)
                     tag = _tag(manifest, index)
                     reply = self.ng.request({"command": "subscribe request", "call-id": row["sip_call_id"], "from-tags": [source_tag],
-                                             "to-tag": tag, "transport protocol": "RTP/AVP", "direction": ["recording", "recording"]})
+                                             "to-tag": tag, "transport protocol": "RTP/AVP", "interface": "recording"})
                     offered.append(_offered_port(reply, tag, source_tag))
-                    answer = self.ng.request({"command": "subscribe answer", "call-id": row["sip_call_id"], "to-tag": tag, "sdp": _sdp(sock.getsockname()[1])})
+                    answer = self.ng.request({"command": "subscribe answer", "call-id": row["sip_call_id"], "to-tag": tag,
+                                              "sdp": _sdp(sock.getsockname()[1]), "flags": ["allow transcoding"]})
                     if not isinstance(answer, dict) or answer.get("result") != "ok": _fail("subscription answer failed")
                 thread = threading.Thread(target=self._receive, args=(session,), daemon=True); session["thread"] = thread
                 self._sessions[manifest] = session; thread.start()

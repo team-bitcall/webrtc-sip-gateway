@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 import uuid
 
 from call_journal import CallJournal, JournalError
@@ -617,6 +618,11 @@ class JournalHandler(http.server.BaseHTTPRequestHandler):
             if self.path == "/v1/call-events/admit":
                 _context, call_id = self.server.journal.admit(body)
                 result = {"schemaVersion": 1, "callId": call_id}
+            elif self.path == "/v1/call-events/managed-admit":
+                intent = self.server.journal.managed_admit_intent(body)
+                result = self.server.managed_callback(intent)
+            elif self.path == "/v1/call-events/managed-bind":
+                result = self.server.journal.bind_managed_lease(body)
             elif self.path == "/v1/call-events/append":
                 result = self.server.journal.append(body)
             elif self.path == "/v1/call-events/media/begin":
@@ -664,6 +670,29 @@ def main():
     store = TenantProjectionStore(directory,
                                   os.environ.get("SEAT_DOMAIN", ""), KamailioRpc())
     events_enabled = os.environ.get("SEAT_CALL_EVENTS") == "1"
+    managed_endpoint = os.environ.get("SEAT_MANAGED_ADMISSION_ENDPOINT", "")
+    managed_secret = os.environ.get("SEAT_MANAGED_ADMISSION_SECRET", "")
+    managed_enabled = os.environ.get("SEAT_MANAGED_ADMISSION_ENABLED") == "1"
+    if managed_enabled and not events_enabled:
+        raise ControlError(503, "MANAGED_ADMISSION_CALL_EVENTS_REQUIRED")
+    def managed_callback(intent):
+        if not managed_enabled: raise ControlError(503, "MANAGED_ADMISSION_CONFIG_REQUIRED")
+        payload = json.dumps({"operation": "admit", "permit": intent["permit"], "seatId": intent["seat_id"],
+                              "sipCallId": intent["sip_call_id"], "fromTag": intent["from_tag"], "gatewayId": intent["gateway_id"]}, separators=(",", ":")).encode()
+        try:
+            request = urllib.request.Request(managed_endpoint, data=payload, method="POST", headers={"Content-Type": "application/json", "Authorization": "Bearer " + managed_secret})
+            with urllib.request.urlopen(request, timeout=2) as response:
+                value = json.loads(response.read().decode())
+                if response.status != 200 or value.get("ok") is not True: raise ValueError("admission denied")
+            journal.managed_intent_result(intent["call_id"], value)
+            return {"ok": True, "leaseId": value["leaseId"], "integrationId": value["integrationId"]}
+        except urllib.error.HTTPError as error:
+            if error.code in (403, 409): journal.managed_intent_denied(intent["call_id"])
+            raise ControlError(error.code if error.code in (403, 409) else 503, "MANAGED_ADMISSION_DENIED") from error
+        except (OSError, ValueError, urllib.error.URLError, JournalError) as error:
+            raise ControlError(503, "MANAGED_ADMISSION_UNCERTAIN") from error
+    if managed_enabled and (not managed_endpoint.startswith("https://") or not re.fullmatch(r"[A-Za-z0-9_-]{43,256}", managed_secret)):
+        raise ControlError(503, "MANAGED_ADMISSION_CONFIG_REQUIRED")
     journal = CallJournal(directory) if events_enabled else None
     recording_enabled = os.environ.get("SEAT_RECORDING_ENABLED") == "1"
     media_journal = MediaJournal(journal) if recording_enabled and journal else None
@@ -705,6 +734,25 @@ def main():
                     journal.compact()
                 except (ControlError, JournalError, sqlite3.Error):
                     pass
+                if managed_enabled:
+                    # Journal state, rather than a SIP worker or browser timer,
+                    # owns retries. Failed renewals never terminate a dialog;
+                    # the long backend sentinel prevents a partition freeing it.
+                    for work in journal.managed_lease_work():
+                        try:
+                            payload = json.dumps({k: work[k] for k in ("operation", "leaseId", "integrationId", "gatewayId")}, separators=(",", ":")).encode()
+                            request = urllib.request.Request(managed_endpoint, data=payload, method="POST",
+                                headers={"Content-Type": "application/json", "Authorization": "Bearer " + managed_secret})
+                            with urllib.request.urlopen(request, timeout=2) as response:
+                                success = response.status == 200 and json.loads(response.read().decode()).get("ok") is True
+                        except (OSError, ValueError, urllib.error.URLError):
+                            success = False
+                        journal.managed_lease_result(work["callId"], work["operation"], success)
+                    for intent in journal.managed_intent_work():
+                        try:
+                            managed_callback(intent)
+                        except ControlError:
+                            pass
             if media:
                 try:
                     media.sweep()
@@ -717,7 +765,7 @@ def main():
     journal_server = journal_worker = None
     if journal:
         journal_server = http.server.ThreadingHTTPServer(("127.0.0.1", 8882), JournalHandler)
-        journal_server.journal, journal_server.token, journal_server.media_journal = journal, token, media_journal
+        journal_server.journal, journal_server.token, journal_server.media_journal, journal_server.managed_callback = journal, token, media_journal, managed_callback
         journal_worker = threading.Thread(target=journal_server.serve_forever, daemon=True)
         journal_worker.start()
     try:

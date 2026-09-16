@@ -1,4 +1,4 @@
-import json, os, sqlite3, sys, tempfile, threading, unittest
+import io, json, os, sqlite3, sys, tempfile, threading, unittest
 from pathlib import Path
 from unittest import mock
 
@@ -123,6 +123,11 @@ class Producer:
 
     def close(self):
         pass
+
+
+class FailingProducer(Producer):
+    def start(self, _row, _tags):
+        raise RuntimeError("secret-sentinel-must-not-appear")
 
 
 class Tests(unittest.TestCase):
@@ -351,6 +356,15 @@ class Tests(unittest.TestCase):
         self.c = self.make(media_guard=guard)
         self.assertEqual(self.start()["state"], "failed")
         self.assertIn({"command": "stop recording", "call-id": "sip-" + CALL}, self.ng.calls)
+
+    def test_start_failure_log_is_fixed_classifier_without_exception_text(self):
+        self.c.close()
+        self.c = self.make(producer=FailingProducer())
+        output = io.StringIO()
+        with mock.patch("recording_capture.sys.stderr", output):
+            self.assertEqual(self.start()["state"], "failed")
+        self.assertEqual(output.getvalue(), "recording_start_failure stage=producer_start classification=unknown\n")
+        self.assertNotIn("secret-sentinel", output.getvalue())
 
     def test_media_guard_already_closed_rejects_start(self):
         self.c.close()

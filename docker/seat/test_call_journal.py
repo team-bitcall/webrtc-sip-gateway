@@ -79,7 +79,7 @@ class CallJournalTests(unittest.TestCase):
             restarted.close()
 
     def test_answer_evidence_reopens_failed_call_but_never_ended_call(self):
-        clock = [1_000]
+        clock = [31_000]
         with tempfile.TemporaryDirectory() as directory:
             os.chmod(directory, 0o700)
             journal = CallJournal(directory, clock=lambda: clock[0])
@@ -131,6 +131,55 @@ class CallJournalTests(unittest.TestCase):
             journal.compact(retention_ms=7)
             self.assertEqual(journal.append({"callId": active_id, "type": "progress", "legId": "", "sipCode": 180,
                                              "reason": None, "endedBy": None})["callId"], active_id)
+            journal.close()
+
+    def test_managed_lease_is_durable_retried_and_released_only_after_terminal_evidence(self):
+        clock = [31_000]
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            journal = CallJournal(directory, clock=lambda: clock[0])
+            _, call_id = journal.admit(context())
+            binding = {"callId": call_id, "integrationId": "t_" + "c" * 64,
+                       "gatewayId": "gateway_a", "leaseId": "gw_" + "d" * 48}
+            self.assertEqual(journal.bind_managed_lease(binding)["status"], "bound")
+            self.assertEqual(journal.managed_lease_work()[0]["operation"], "renew")
+            journal.managed_lease_result(call_id, "renew", False)
+            self.assertEqual(journal.managed_lease_work()[0]["operation"], "renew")
+            journal.append({"callId": call_id, "type": "ended", "legId": "", "sipCode": 200,
+                            "reason": "normal", "endedBy": "agent"})
+            self.assertEqual(journal.managed_lease_work()[0]["operation"], "release")
+            journal.managed_lease_result(call_id, "release", True)
+            self.assertEqual(journal.managed_lease_work(), [])
+            journal.close()
+
+    def test_managed_intent_survives_lost_callback_response_and_binds_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            journal = CallJournal(directory)
+            _, call_id = journal.admit(context())
+            intent = journal.managed_admit_intent({"callId": call_id, "permit": "x" * 43,
+                "seatId": context()["seatId"], "sipCallId": context()["sipCallId"], "fromTag": context()["fromTag"], "gatewayId": "gateway_a"})
+            self.assertEqual(intent["resolved"], 0)
+            journal.close()
+            journal = CallJournal(directory)
+            pending = journal.managed_intent_work()
+            self.assertEqual(len(pending), 1)
+            journal.managed_intent_result(call_id, {"leaseId": "gw_" + "d" * 48, "integrationId": "partner:équipe-178"})
+            self.assertEqual(journal.managed_intent_work(), [])
+            self.assertEqual(journal.managed_lease_work()[0]["leaseId"], "gw_" + "d" * 48)
+            journal.close()
+
+    def test_managed_intent_resolution_rolls_back_on_conflicting_lease(self):
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o700)
+            journal = CallJournal(directory)
+            _, call_id = journal.admit(context())
+            journal.managed_admit_intent({"callId": call_id, "permit": "x" * 43,
+                "seatId": context()["seatId"], "sipCallId": context()["sipCallId"], "fromTag": context()["fromTag"], "gatewayId": "gateway_a"})
+            journal.bind_managed_lease({"callId": call_id, "integrationId": "partner:équipe-178", "gatewayId": "gateway_a", "leaseId": "gw_" + "e" * 48})
+            with self.assertRaises(JournalError):
+                journal.managed_intent_result(call_id, {"leaseId": "gw_" + "d" * 48, "integrationId": "partner:équipe-178"})
+            self.assertEqual(journal.managed_intent(call_id)["resolved"], 0)
             journal.close()
 
 

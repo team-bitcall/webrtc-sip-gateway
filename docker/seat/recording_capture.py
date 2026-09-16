@@ -1,10 +1,11 @@
 """Private fail-closed RTPengine capture producer."""
 
-import fcntl, json, os, re, shutil, sqlite3, stat, threading, time
+import fcntl, json, os, re, shutil, sqlite3, stat, sys, threading, time
 from pathlib import Path
 from itertools import islice
 from urllib.parse import urlsplit
 from recording_decode import finalize_capture
+from recording_subscription import SubscriptionError
 
 try:
     from media_control import resolve_media_call
@@ -18,6 +19,39 @@ class CaptureError(Exception):
     def __init__(self, code, status=503):
         self.code, self.status = code, status
         super().__init__(code)
+
+
+_START_FAILURE_CODES = {
+    "RECORDING_MEDIA_UNAVAILABLE", "RECORDING_MEDIA_UNCERTAIN",
+    "RECORDING_UNAVAILABLE",
+}
+_START_FAILURE_STAGES = {
+    "media_checkpoint", "call_resolution", "source_validation", "producer_start", "dispatch",
+}
+_SUBSCRIPTION_FAILURES = {
+    "subscription request failed": "request", "invalid subscription SDP": "offer",
+    "subscription answer failed": "answer", "subscription limit": "limit",
+    "untrusted subscription packet": "packet", "pcap write failed": "write",
+    "subscription writer still running": "writer", "unsubscribe failed": "unsubscribe",
+}
+
+
+def _start_failure_classification(error):
+    """Return a fixed diagnostic label; never serialize an exception."""
+    if isinstance(error, CaptureError) and error.code in _START_FAILURE_CODES:
+        return "capture-" + error.code.lower()
+    if isinstance(error, SubscriptionError):
+        return "subscription-" + _SUBSCRIPTION_FAILURES.get(str(error), "unknown")
+    if isinstance(error, OSError):
+        return "filesystem"
+    return "unknown"
+
+
+def _log_start_failure(error, stage="producer_start"):
+    if stage not in _START_FAILURE_STAGES:
+        stage = "unknown"
+    print("recording_start_failure stage=" + stage + " classification=" + _start_failure_classification(error),
+          file=sys.stderr, flush=True)
 
 
 def _dir(v):
@@ -528,10 +562,22 @@ class CaptureController:
                 >= self.max_concurrent
             ):
                 self._err("RECORDING_LIMIT")
-            media_checkpoint = self._media_checkpoint(v["callId"])
-            sip, tags = self._resolve(t, v["callId"])
-            query = self.ng.request({"command": "query", "call-id": sip})
-            sources = self._source(query, tags)
+            try:
+                media_checkpoint = self._media_checkpoint(v["callId"])
+            except Exception as error:
+                _log_start_failure(error, "media_checkpoint")
+                raise
+            try:
+                sip, tags = self._resolve(t, v["callId"])
+            except Exception as error:
+                _log_start_failure(error, "call_resolution")
+                raise
+            try:
+                query = self.ng.request({"command": "query", "call-id": sip})
+                sources = self._source(query, tags)
+            except Exception as error:
+                _log_start_failure(error, "source_validation")
+                raise
             if self.producer is not None:
                 # Preserve the verified initial codec/SSRC for audit; only the
                 # transport selector changes to our per-leg synthetic tuple.
@@ -587,7 +633,8 @@ class CaptureController:
                         "UPDATE captures SET state='capturing' WHERE manifest_id=?",
                         (v["manifestId"],),
                     )
-            except Exception:
+            except Exception as error:
+                _log_start_failure(error)
                 with self.db:
                     self.db.execute(
                         "UPDATE captures SET state='failed',error='RECORDING_START_FAILED',stop_pending=1 WHERE manifest_id=?",

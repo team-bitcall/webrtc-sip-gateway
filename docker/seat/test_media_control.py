@@ -1,10 +1,11 @@
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from call_journal import CallJournal
 from media_control import MediaController, MediaError
-from media_watchdog import MediaWatchdog
+from media_watchdog import MediaStorePending, MediaWatchdog, main as watchdog_main, wait_for_store
 
 
 TENANT = "t_" + "a" * 64
@@ -174,6 +175,37 @@ class MediaControlTests(unittest.TestCase):
                                           clock=lambda: self.now[0], ng=self.ng,
                                           projection=lambda _tenant: {"status": "applied", "validUntil": 999999})
         self.assertEqual(self.controller._row(TENANT, LISTENER)["state"], "ended")
+
+    def test_watchdog_waits_for_controller_store_at_startup(self):
+        self.controller.close()
+        os.unlink(os.path.join(self.temp.name, "media-control.sqlite3"))
+        waits = []
+
+        def create_store(seconds):
+            waits.append(seconds)
+            replacement = MediaController(self.temp.name, self.journal, self.rpc,
+                                          clock=lambda: self.now[0], ng=self.ng,
+                                          projection=lambda _tenant: {"status": "applied", "validUntil": 999999})
+            replacement.close()
+
+        guard = wait_for_store(self.temp.name, delay=create_store)
+        guard.close()
+        self.assertEqual(waits, [1])
+        self.controller = MediaController(self.temp.name, self.journal, self.rpc,
+                                          clock=lambda: self.now[0], ng=self.ng,
+                                          projection=lambda _tenant: {"status": "applied", "validUntil": 999999})
+
+    def test_watchdog_once_fails_fast_when_store_is_missing(self):
+        self.controller.close()
+        os.unlink(os.path.join(self.temp.name, "media-control.sqlite3"))
+        with mock.patch.dict(os.environ, {"SEAT_MODE": "managed", "SEAT_MEDIA_ENABLED": "1",
+                                          "SEAT_STATE_DIR": self.temp.name}), \
+                mock.patch("sys.argv", ["media_watchdog.py", "--once"]), \
+                self.assertRaises(MediaStorePending):
+            watchdog_main()
+        self.controller = MediaController(self.temp.name, self.journal, self.rpc,
+                                          clock=lambda: self.now[0], ng=self.ng,
+                                          projection=lambda _tenant: {"status": "applied", "validUntil": 999999})
 
     def test_watchdog_wins_late_answer_and_old_tag_cannot_hit_new_listener(self):
         offered = self.start()

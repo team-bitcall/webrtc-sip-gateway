@@ -62,6 +62,18 @@ class RecordingTransportTests(unittest.TestCase):
         thread.join(2)
         server.close()
 
+    def test_runtime_dispatch_logs_capture_errors_only_for_start_commands(self):
+        runtime = RecordingRuntime.__new__(RecordingRuntime)
+        runtime.config, runtime.controller, runtime.validator = {"gateway_id": "https://gateway.test"}, object(), None
+        with mock.patch("recording_runtime.dispatch", side_effect=CaptureError("RECORDING_NOT_FOUND", 404)), \
+             mock.patch("recording_runtime._log_start_failure") as logged:
+            with self.assertRaises(CaptureError):
+                runtime._dispatch("tenant", {"command": {"action": "status"}})
+            logged.assert_not_called()
+            with self.assertRaises(CaptureError):
+                runtime._dispatch("tenant", {"command": {"action": "start"}})
+            logged.assert_called_once_with(mock.ANY, "dispatch")
+
         def denied(_tenant, _request):
             raise CaptureError("RECORDING_NOT_FOUND", 404)
 

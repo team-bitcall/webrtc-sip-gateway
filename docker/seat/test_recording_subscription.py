@@ -40,7 +40,35 @@ class StartFailNg(Ng):
         return super().request(value)
 
 
+class RecordingInterfaceNg(Ng):
+    def __init__(self): self.calls = []
+    def request(self, value):
+        self.calls.append(value)
+        if value["command"] == "subscribe request":
+            return {"result": "ok", "to-tag": value["to-tag"], "from-tags": value["from-tags"],
+                    "sdp": "v=0\r\nc=IN IP4 127.0.0.1\r\nm=audio 4000 RTP/AVP 0\r\na=sendonly\r\n"}
+        if value["command"] in {"subscribe answer", "unsubscribe"}: return {"result": "ok"}
+        return super().request(value)
+
+
 class SubscriptionTests(unittest.TestCase):
+    def test_start_uses_named_recording_interface(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary); (root / "pcaps").mkdir(); (root / "metadata").mkdir()
+            ng = RecordingInterfaceNg()
+            producer = SubscriptionProducer(ng, root / "pcaps", root / "metadata", 4096, 10)
+            try:
+                producer.start(ROW, ("agent", "remote"))
+                requests = [value for value in ng.calls if value["command"] == "subscribe request"]
+                self.assertEqual(len(requests), 2)
+                self.assertTrue(all(value.get("interface") == "recording" for value in requests))
+                self.assertTrue(all("direction" not in value for value in requests))
+                answers = [value for value in ng.calls if value["command"] == "subscribe answer"]
+                self.assertEqual(len(answers), 2)
+                self.assertTrue(all(value.get("flags") == ["allow transcoding"] for value in answers))
+            finally:
+                producer.stop(ROW)
+
     def test_crash_metadata_prefix_and_known_hardlink_pair_recover(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

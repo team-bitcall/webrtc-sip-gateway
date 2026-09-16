@@ -14,6 +14,10 @@ import time
 from media_control import MediaError, NgClient, TAG
 
 
+class MediaStorePending(Exception):
+    """The media controller has not created its durable store yet."""
+
+
 class MediaWatchdog:
     def __init__(self, directory, *, ng=None, clock=lambda: int(time.time() * 1000)):
         directory = Path(directory)
@@ -21,7 +25,10 @@ class MediaWatchdog:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise MediaError("MEDIA_UNAVAILABLE")
         path = directory / "media-control.sqlite3"
-        info = path.lstat()
+        try:
+            info = path.lstat()
+        except FileNotFoundError as error:
+            raise MediaStorePending() from error
         if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
             raise MediaError("MEDIA_UNAVAILABLE")
         self.db = sqlite3.connect(path, timeout=.05)
@@ -91,13 +98,22 @@ class MediaWatchdog:
         return cleaned
 
 
+def wait_for_store(directory, *, delay=time.sleep):
+    while True:
+        try:
+            return MediaWatchdog(directory)
+        except MediaStorePending:
+            delay(1)
+
+
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--once", action="store_true")
     args = parser.parse_args()
     if os.environ.get("SEAT_MODE") != "managed" or os.environ.get("SEAT_MEDIA_ENABLED") != "1":
         return 0
-    guard = MediaWatchdog(os.environ.get("SEAT_STATE_DIR", ""))
+    directory = os.environ.get("SEAT_STATE_DIR", "")
+    guard = MediaWatchdog(directory) if args.once else wait_for_store(directory)
     try:
         if args.once:
             guard.sweep()

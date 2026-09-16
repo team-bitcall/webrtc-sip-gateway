@@ -23,6 +23,16 @@ DESTINATION_RE = re.compile(r"[+]?[0-9*#]{1,32}\Z")
 USER_RE = re.compile(r"[A-Za-z0-9+._-]{1,128}\Z")
 
 
+def _integration_id(value):
+    # Integration IDs are legacy opaque backend IDs, not projected CDR tenants.
+    if not isinstance(value, str) or not value or value != value.strip() or any(ord(c) < 32 or 127 <= ord(c) <= 159 for c in value):
+        return False
+    try:
+        return len(value.encode("utf-8")) <= 128
+    except UnicodeEncodeError:
+        return False
+
+
 class JournalError(Exception):
     def __init__(self, code, status=503):
         self.code, self.status = code, status
@@ -82,6 +92,16 @@ class CallJournal:
             acknowledged_through INTEGER NOT NULL DEFAULT 0);
           CREATE INDEX IF NOT EXISTS events_tenant_sequence ON events(tenant_id, sequence);
           CREATE INDEX IF NOT EXISTS events_call_sequence ON events(call_id, sequence);
+          CREATE TABLE IF NOT EXISTS managed_leases (
+            call_id TEXT PRIMARY KEY, integration_id TEXT NOT NULL, gateway_id TEXT NOT NULL,
+            lease_id TEXT NOT NULL, released INTEGER NOT NULL DEFAULT 0,
+            last_renewed_at INTEGER NOT NULL DEFAULT 0, last_attempt_at INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY(call_id) REFERENCES calls(call_id));
+          CREATE TABLE IF NOT EXISTS managed_intents (
+            call_id TEXT PRIMARY KEY, permit TEXT NOT NULL, seat_id TEXT NOT NULL,
+            sip_call_id TEXT NOT NULL, from_tag TEXT NOT NULL, gateway_id TEXT NOT NULL,
+            integration_id TEXT, lease_id TEXT, resolved INTEGER NOT NULL DEFAULT 0,
+            last_attempt_at INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(call_id) REFERENCES calls(call_id));
         """)
         if "acked_at" not in {row[1] for row in self.db.execute("PRAGMA table_info(events)")}:
             self.db.execute("ALTER TABLE events ADD COLUMN acked_at INTEGER")
@@ -211,6 +231,79 @@ class CallJournal:
                 raise JournalError("JOURNAL_CAPACITY")
             return self._append(json.loads(row["context"]), value["callId"], value["type"], int(self.clock()),
                                 value["legId"], value["sipCode"], value["reason"], value["endedBy"])
+
+    def bind_managed_lease(self, value):
+        if not isinstance(value, dict) or set(value) != {"callId", "integrationId", "gatewayId", "leaseId"} \
+                or not isinstance(value["callId"], str) or not HEX_RE.fullmatch(value["callId"]) \
+                or not _integration_id(value["integrationId"]) \
+                or not isinstance(value["gatewayId"], str) or not USER_RE.fullmatch(value["gatewayId"]) \
+                or not isinstance(value["leaseId"], str) or not re.fullmatch(r"gw_[0-9a-f]{48}", value["leaseId"]):
+            raise JournalError("INVALID_CALL_EVENT", 400)
+        with self.lock, self.db:
+            if not self.db.execute("SELECT 1 FROM calls WHERE call_id=?", (value["callId"],)).fetchone(): raise JournalError("CALL_NOT_FOUND", 404)
+            old = self.db.execute("SELECT integration_id,gateway_id,lease_id FROM managed_leases WHERE call_id=?", (value["callId"],)).fetchone()
+            if old and tuple(old) != (value["integrationId"], value["gatewayId"], value["leaseId"]): raise JournalError("MANAGED_LEASE_CONFLICT", 409)
+            self.db.execute("INSERT OR IGNORE INTO managed_leases(call_id,integration_id,gateway_id,lease_id) VALUES (?,?,?,?)",
+                            (value["callId"], value["integrationId"], value["gatewayId"], value["leaseId"]))
+        return {"callId": value["callId"], "status": "bound"}
+
+    def managed_admit_intent(self, value):
+        required = {"callId", "permit", "seatId", "sipCallId", "fromTag", "gatewayId"}
+        if not isinstance(value, dict) or set(value) != required or not isinstance(value["callId"], str) or not HEX_RE.fullmatch(value["callId"]) \
+                or not isinstance(value["permit"], str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", value["permit"]) \
+                or not isinstance(value["seatId"], str) or not SEAT_RE.fullmatch(value["seatId"]) \
+                or not isinstance(value["sipCallId"], str) or not value["sipCallId"] or not isinstance(value["fromTag"], str) or not value["fromTag"] \
+                or not isinstance(value["gatewayId"], str) or not USER_RE.fullmatch(value["gatewayId"]): raise JournalError("INVALID_CALL_EVENT", 400)
+        with self.lock, self.db:
+            if not self.db.execute("SELECT 1 FROM calls WHERE call_id=?", (value["callId"],)).fetchone(): raise JournalError("CALL_NOT_FOUND", 404)
+            old = self.db.execute("SELECT permit,seat_id,sip_call_id,from_tag,gateway_id FROM managed_intents WHERE call_id=?", (value["callId"],)).fetchone()
+            fields = (value["permit"], value["seatId"], value["sipCallId"], value["fromTag"], value["gatewayId"])
+            if old and tuple(old) != fields: raise JournalError("MANAGED_LEASE_CONFLICT", 409)
+            self.db.execute("INSERT OR IGNORE INTO managed_intents(call_id,permit,seat_id,sip_call_id,from_tag,gateway_id) VALUES (?,?,?,?,?,?)", (value["callId"], *fields))
+        return self.managed_intent(value["callId"])
+
+    def managed_intent(self, call_id):
+        with self.lock:
+            row = self.db.execute("SELECT * FROM managed_intents WHERE call_id=?", (call_id,)).fetchone()
+        if not row: raise JournalError("CALL_NOT_FOUND", 404)
+        return dict(row)
+
+    def managed_intent_result(self, call_id, result):
+        if not isinstance(result, dict) or not isinstance(result.get("leaseId"), str) or not re.fullmatch(r"gw_[0-9a-f]{48}", result["leaseId"]) or not _integration_id(result.get("integrationId")): raise JournalError("INVALID_CALL_EVENT", 400)
+        with self.lock, self.db:
+            row = self.db.execute("SELECT gateway_id FROM managed_intents WHERE call_id=?", (call_id,)).fetchone()
+            if not row: raise JournalError("CALL_NOT_FOUND", 404)
+            old = self.db.execute("SELECT integration_id,gateway_id,lease_id FROM managed_leases WHERE call_id=?", (call_id,)).fetchone()
+            expected = (result["integrationId"], row["gateway_id"], result["leaseId"])
+            if old and tuple(old) != expected: raise JournalError("MANAGED_LEASE_CONFLICT", 409)
+            # Binding and resolution share one SQLite transaction. Any failure
+            # rolls both back, leaving the durable intent retryable.
+            self.db.execute("INSERT OR IGNORE INTO managed_leases(call_id,integration_id,gateway_id,lease_id) VALUES (?,?,?,?)", (call_id, *expected))
+            self.db.execute("UPDATE managed_intents SET integration_id=?,lease_id=?,resolved=1,last_attempt_at=? WHERE call_id=?", (result["integrationId"], result["leaseId"], int(self.clock()), call_id))
+        return {"callId": call_id, "status": "bound"}
+
+    def managed_intent_denied(self, call_id):
+        with self.lock, self.db:
+            self.db.execute("UPDATE managed_intents SET resolved=2,last_attempt_at=? WHERE call_id=? AND resolved=0", (int(self.clock()), call_id))
+
+    def managed_intent_work(self):
+        with self.lock:
+            rows = self.db.execute("SELECT i.*,c.terminal FROM managed_intents i JOIN calls c ON c.call_id=i.call_id WHERE i.resolved=0").fetchall()
+        return [dict(row) for row in rows]
+
+    def managed_lease_work(self, renew_after_ms=30000):
+        now = int(self.clock())
+        with self.lock:
+            rows = self.db.execute("SELECT l.call_id,l.integration_id,l.gateway_id,l.lease_id,l.released,l.last_renewed_at,c.terminal FROM managed_leases l JOIN calls c ON c.call_id=l.call_id WHERE l.released=0").fetchall()
+        return [{"operation": "release" if row["terminal"] else "renew", "callId": row["call_id"], "integrationId": row["integration_id"], "gatewayId": row["gateway_id"], "leaseId": row["lease_id"]}
+                for row in rows if row["terminal"] or now - row["last_renewed_at"] >= renew_after_ms]
+
+    def managed_lease_result(self, call_id, operation, success):
+        if not isinstance(call_id, str) or not HEX_RE.fullmatch(call_id) or operation not in {"renew", "release"}: raise JournalError("INVALID_CALL_EVENT", 400)
+        with self.lock, self.db:
+            if operation == "release" and success: self.db.execute("UPDATE managed_leases SET released=1,last_attempt_at=? WHERE call_id=?", (int(self.clock()), call_id))
+            elif operation == "renew" and success: self.db.execute("UPDATE managed_leases SET last_renewed_at=?,last_attempt_at=? WHERE call_id=?", (int(self.clock()), int(self.clock()), call_id))
+            else: self.db.execute("UPDATE managed_leases SET last_attempt_at=? WHERE call_id=?", (int(self.clock()), call_id))
 
     def events(self, tenant_id, after=0, limit=100):
         if not TENANT_RE.fullmatch(tenant_id) or type(after) is not int or after < 0 or type(limit) is not int or not 1 <= limit <= 100:

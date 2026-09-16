@@ -138,6 +138,20 @@ has its own task 09 acceptance record there.
 
 ## Managed call-event journal (Task 11 foundation)
 
+### Managed integration lease reconciliation
+
+When a snapshot explicitly sets `managedAdmission: true`, the gateway requires
+`SEAT_CALL_EVENTS=1`, `SEAT_MANAGED_ADMISSION_ENABLED=1`, an HTTPS backend
+callback, callback secret, and stable gateway ID. The durable journal binds the
+backend integration lease only after it has created the call identity, renews
+it while the journal considers the call active, and retries release after a
+terminal event. Backend managed leases intentionally have no automatic active
+expiry: a network partition must not free an ongoing call. Operations must
+reconcile an orphan only after the durable journal and authoritative Kamailio
+dialog inventory both show it terminal, then invoke the authenticated backend
+release callback with its recorded lease ID. Legacy `call_slots` retain their
+90-second browser-lease behaviour.
+
 `SEAT_CALL_EVENTS=1` is intended only for managed seat mode with the existing
 private durable state mount. It keeps an independent SQLite WAL journal beside,
 but separate from, snapshot projection state. The helper exposes a loopback-only

@@ -11,7 +11,7 @@ import time
 from urllib.parse import quote
 
 from media_control import NgClient
-from recording_capture import CaptureController
+from recording_capture import CaptureController, CaptureError, _log_start_failure
 from media_journal import media_checkpoint
 from recording_retention import RecordingRetention
 from recording_subscription import SubscriptionProducer
@@ -245,18 +245,20 @@ class RecordingRuntime:
                     self.controller.limits["maxInputBytes"], self.controller.limits["maxPackets"],
                 )
             self.retention = RecordingRetention(self.controller, **(config.get("retention") or {}))
-            self.server = RecordingTransportServer(
-                config["state"],
-                lambda tenant, request: dispatch(
-                    self.controller,
-                    tenant,
-                    request,
-                    config["gateway_id"],
-                    validator=self.validator,
-                ),
-            )
+            self.server = RecordingTransportServer(config["state"], self._dispatch)
         except Exception:
             self.close()
+            raise
+
+    def _dispatch(self, tenant, request):
+        try:
+            return dispatch(self.controller, tenant, request, self.config["gateway_id"], validator=self.validator)
+        except CaptureError as error:
+            # CaptureError.code is an internal fixed vocabulary; no request data
+            # or exception text reaches the diagnostic stream.
+            command = request.get("command") if isinstance(request, dict) else None
+            if isinstance(command, dict) and command.get("action") == "start":
+                _log_start_failure(error, "dispatch")
             raise
 
     def _failed(self, operation):
