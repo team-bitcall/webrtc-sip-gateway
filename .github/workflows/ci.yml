@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - 'FEAT/webphone-expansion'
+      - 'release-candidate'
   pull_request:
 
 jobs:
