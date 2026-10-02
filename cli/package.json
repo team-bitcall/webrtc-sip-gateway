@@ -2,6 +2,15 @@
   "name": "@bitcall/webrtc-sip-gateway",
   "version": "0.3.12",
   "description": "Linux CLI for bootstrapping and managing the Bitcall WebRTC-to-SIP Gateway",
+  "homepage": "https://bitcall.io",
+  "keywords": [
+    "webrtc",
+    "sip",
+    "gateway",
+    "kamailio",
+    "rtpengine",
+    "voip"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/Bitcallio/webrtc-sip-gateway"

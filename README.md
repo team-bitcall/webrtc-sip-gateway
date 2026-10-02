@@ -1,6 +1,6 @@
 # webrtc-sip-gateway
 
-Bitcall WebRTC-to-SIP gateway repository.
+[Bitcall](https://bitcall.io) WebRTC-to-SIP gateway repository.
 
 ## Components
 
